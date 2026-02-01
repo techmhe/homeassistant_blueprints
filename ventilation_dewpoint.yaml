@@ -1,0 +1,58 @@
+blueprint:
+  name: Ventilation Recommendation Based on Dewpoint
+  description: >
+    Creates a binary sensor that recommends ventilation based on dewpoint difference
+    between inside and outside. Ventilation is recommended when the outside dewpoint
+    is lower than the inside dewpoint by more than the specified threshold.
+  domain: template
+  input:
+    dewpoint_outside:
+      name: Outside Dewpoint Sensor
+      description: Sensor that measures the outside dewpoint temperature
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+    dewpoint_inside:
+      name: Inside Dewpoint Sensor
+      description: Sensor that measures the inside dewpoint temperature
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+    threshold:
+      name: Threshold
+      description: >
+        Minimum difference in degrees between inside and outside dewpoint
+        for ventilation to be recommended. Ventilation is recommended when
+        (inside dewpoint - outside dewpoint) > threshold.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 20
+          step: 0.5
+          unit_of_measurement: "°"
+          mode: slider
+
+variables:
+  dewpoint_outside_entity: !input dewpoint_outside
+  dewpoint_inside_entity: !input dewpoint_inside
+  threshold_value: !input threshold
+
+binary_sensor:
+  - name: Ventilation Recommendation
+    unique_id: ventilation_recommendation_dewpoint
+    availability: >
+      {{ states(dewpoint_inside_entity) not in ['unknown', 'unavailable'] and
+         states(dewpoint_outside_entity) not in ['unknown', 'unavailable'] }}
+    state: >
+      {% set inside_dewpoint = states(dewpoint_inside_entity) | float(0) %}
+      {% set outside_dewpoint = states(dewpoint_outside_entity) | float(0) %}
+      {{ (inside_dewpoint - outside_dewpoint) > threshold_value }}
+    icon: >
+      {% if this.state == 'on' %}
+        mdi:window-open
+      {% else %}
+        mdi:window-closed
+      {% endif %}
