@@ -12,14 +12,14 @@ blueprint:
       selector:
         entity:
           filter:
-            - domain: sensor
+            domain: sensor
     dewpoint_inside:
       name: Inside Dewpoint Sensor
       description: Sensor that measures the inside dewpoint temperature
       selector:
         entity:
           filter:
-            - domain: sensor
+            domain: sensor
     threshold:
       name: Threshold
       description: >
