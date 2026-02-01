@@ -41,18 +41,18 @@ variables:
   threshold_value: !input threshold
 
 binary_sensor:
-  - name: Ventilation Recommendation
-    unique_id: ventilation_recommendation_dewpoint
-    availability: >
-      {{ states(dewpoint_inside_entity) not in ['unknown', 'unavailable'] and
-         states(dewpoint_outside_entity) not in ['unknown', 'unavailable'] }}
-    state: >
-      {% set inside_dewpoint = states(dewpoint_inside_entity) | float(0) %}
-      {% set outside_dewpoint = states(dewpoint_outside_entity) | float(0) %}
-      {{ (inside_dewpoint - outside_dewpoint) > threshold_value }}
-    icon: >
-      {% if this.state == 'on' %}
-        mdi:window-open
-      {% else %}
-        mdi:window-closed
-      {% endif %}
+  name: Ventilation Recommendation
+  unique_id: ventilation_recommendation_dewpoint
+  availability: >
+    {{ states(dewpoint_inside_entity) not in ['unknown', 'unavailable'] and
+       states(dewpoint_outside_entity) not in ['unknown', 'unavailable'] }}
+  state: >
+    {% set inside_dewpoint = states(dewpoint_inside_entity) | float(0) %}
+    {% set outside_dewpoint = states(dewpoint_outside_entity) | float(0) %}
+    {{ (inside_dewpoint - outside_dewpoint) > threshold_value }}
+  icon: >
+    {% if this.state == 'on' %}
+      mdi:window-open
+    {% else %}
+      mdi:window-closed
+    {% endif %}
