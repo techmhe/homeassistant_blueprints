@@ -228,6 +228,17 @@ blueprint:
           unit_of_measurement: "W"
           mode: slider
 
+    force_mode_select:
+      name: "Force Mode Auswahl"
+      description: >
+        Select-Entity für den Force Mode des Marstek Venus (Modbus).
+        Mögliche Werte: halt (Stopp), laden (Laden), entladen (Entladen).
+        Standard-Entity: select.marstek_venus_modbus_force_mode
+      selector:
+        entity:
+          filter:
+            domain: select
+
 mode: single
 max_exceeded: silent
 
@@ -247,6 +258,7 @@ variables:
   max_soc_value: !input max_soc
   discharge_delay_value: !input discharge_delay
   discharge_step_value: !input discharge_step
+  force_mode_entity: !input force_mode_select
 
 trigger:
   - platform: state
@@ -294,6 +306,16 @@ action:
               entity_id: !input discharge_power_number
             data:
               value: "{{ effective_discharge | int(0) }}"
+          - service: select.select_option
+            target:
+              entity_id: !input force_mode_select
+            data:
+              option: >
+                {% if effective_discharge | int(0) > 0 %}
+                  entladen
+                {% else %}
+                  halt
+                {% endif %}
 
       - conditions:
           - condition: state
@@ -419,3 +441,15 @@ action:
               entity_id: !input charge_power_number
             data:
               value: "{{ charge_target | int(0) }}"
+          - service: select.select_option
+            target:
+              entity_id: !input force_mode_select
+            data:
+              option: >
+                {% if ramped_discharge | int(0) > 0 %}
+                  entladen
+                {% elif charge_target | int(0) > 0 %}
+                  laden
+                {% else %}
+                  halt
+                {% endif %}
