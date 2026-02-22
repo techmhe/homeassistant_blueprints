@@ -338,14 +338,14 @@ action:
             target:
               entity_id: !input discharge_power_number
             data:
-              value: "{{ effective_discharge | int(0) }}"
+              value: "{{ effective_discharge | round(0) | int }}"
               
           - service: select.select_option
             target:
               entity_id: !input force_mode_select
             data:
               option: >
-                {% if effective_discharge | int(0) > 0 %}
+                {% if effective_discharge | round(0) | int > 0 %}
                   discharge
                 {% else %}
                   stop
@@ -469,22 +469,22 @@ action:
             target:
               entity_id: !input discharge_power_number
             data:
-              value: "{{ ramped_discharge | int(0) }}"
+              value: "{{ ramped_discharge | round(0) | int }}"
               
           - service: number.set_value
             target:
               entity_id: !input charge_power_number
             data:
-              value: "{{ charge_target_final | int(0) }}"
+              value: "{{ charge_target_final | round(0) | int }}"
               
           - service: select.select_option
             target:
               entity_id: !input force_mode_select
             data:
               option: >
-                {% if ramped_discharge | int(0) > 0 %}
+                {% if ramped_discharge | round(0) | int > 0 %}
                   discharge
-                {% elif charge_target_final | int(0) > 0 and states(pv_power_entity) | float(0) > 0 %}
+                {% elif charge_target_final | round(0) | int > 0 and states(pv_power_entity) | float(0) > 0 %}
                   charge
                 {% else %}
                   stop
