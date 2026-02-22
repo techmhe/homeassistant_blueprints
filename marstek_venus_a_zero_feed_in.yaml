@@ -1,0 +1,301 @@
+blueprint:
+  name: "Marstek Venus A – Nulleinspeisung (Zero Feed-In)"
+  description: >
+    Steuert den Marstek Venus A Batteriespeicher via Modbus-Integration für eine
+    Nulleinspeisung. Nutzt einen Leistungsmesser (z.B. Shelly Pro3 EM) zur Messung
+    der Netzleistung und regelt die Lade-/Entladeleistung des Speichers automatisch,
+    sodass möglichst kein Strom ins Netz eingespeist wird.
+
+
+    Funktionen:
+
+    - Automatische Nulleinspeisung (aktivierbar/deaktivierbar)
+
+    - Manuelle Einspeisungssteuerung mit einstellbarer Leistung
+
+    - Einstellbare maximale Netzeinspeisung
+
+    - Einstellbare maximale Lade- und Entladeleistung
+
+    - Einstellbarer minimaler und maximaler SOC
+
+
+    Voraussetzungen:
+
+    - Marstek Venus A mit Modbus-Integration
+      (https://github.com/ViperRNMC/marstek_venus_modbus)
+
+    - Leistungsmesser am Netzanschluss (z.B. Shelly Pro3 EM)
+
+    - Zwei Input-Boolean-Helfer (Nulleinspeisung ein/aus, Manuelle Einspeisung ein/aus)
+
+    - Ein Input-Number-Helfer für die manuelle Entladeleistung
+
+
+    Hinweis zum Netzleistungs-Sensor:
+    Positive Werte = Netzbezug (Import), Negative Werte = Netzeinspeisung (Export).
+    Dies ist der Standard bei Shelly-Geräten.
+  domain: automation
+  input:
+    grid_power_sensor:
+      name: "Netzleistung Sensor"
+      description: >
+        Sensor für die aktuelle Netzleistung (z.B. Shelly Pro3 EM).
+        Positiv = Netzbezug, Negativ = Netzeinspeisung.
+      selector:
+        entity:
+          filter:
+            domain: sensor
+            device_class: power
+
+    battery_soc_sensor:
+      name: "Batterie-Ladezustand (SOC)"
+      description: "Sensor für den aktuellen Batterie-Ladezustand in Prozent."
+      selector:
+        entity:
+          filter:
+            domain: sensor
+            device_class: battery
+
+    discharge_power_number:
+      name: "Entladeleistung einstellen"
+      description: >
+        Number-Entity zum Einstellen der Entladeleistung des Marstek Venus A
+        (z.B. number.marstek_venus_modbus_entladeleistung_einstellen).
+      selector:
+        entity:
+          filter:
+            domain: number
+
+    charge_power_number:
+      name: "Ladeleistung einstellen"
+      description: >
+        Number-Entity zum Einstellen der Ladeleistung des Marstek Venus A
+        (z.B. number.marstek_venus_modbus_ladeleistung_einstellen).
+      selector:
+        entity:
+          filter:
+            domain: number
+
+    zero_feed_in_enabled:
+      name: "Nulleinspeisung aktivieren"
+      description: >
+        Input Boolean zum Aktivieren/Deaktivieren der automatischen Nulleinspeisung.
+        Erstellen Sie dazu einen Helfer (input_boolean) in Home Assistant.
+      selector:
+        entity:
+          filter:
+            domain: input_boolean
+
+    manual_feed_in_enabled:
+      name: "Manuelle Einspeisung aktivieren"
+      description: >
+        Input Boolean zum Aktivieren der manuellen Einspeisung.
+        Wenn aktiv, wird die eingestellte manuelle Leistung verwendet.
+        Hat Vorrang vor der automatischen Nulleinspeisung.
+      selector:
+        entity:
+          filter:
+            domain: input_boolean
+
+    manual_discharge_power:
+      name: "Manuelle Entladeleistung"
+      description: >
+        Input Number für die gewünschte manuelle Entladeleistung in Watt.
+        Wird nur verwendet, wenn die manuelle Einspeisung aktiviert ist.
+      selector:
+        entity:
+          filter:
+            domain: input_number
+
+    max_grid_feed_in:
+      name: "Maximale Netzeinspeisung (W)"
+      description: >
+        Maximale erlaubte Einspeisung ins Netz in Watt.
+        Bei 0 wird keine Einspeisung erlaubt (echte Nulleinspeisung).
+        Werte > 0 erlauben eine begrenzte Einspeisung als Toleranz.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 2000
+          step: 10
+          unit_of_measurement: "W"
+          mode: slider
+
+    max_discharge_power:
+      name: "Maximale Entladeleistung (W)"
+      description: "Maximale Entladeleistung der Batterie in Watt."
+      default: 800
+      selector:
+        number:
+          min: 0
+          max: 2500
+          step: 50
+          unit_of_measurement: "W"
+          mode: slider
+
+    max_charge_power:
+      name: "Maximale Ladeleistung (W)"
+      description: "Maximale Ladeleistung der Batterie in Watt."
+      default: 800
+      selector:
+        number:
+          min: 0
+          max: 2500
+          step: 50
+          unit_of_measurement: "W"
+          mode: slider
+
+    min_soc:
+      name: "Minimaler SOC (%)"
+      description: >
+        Minimaler Batterie-Ladezustand in Prozent.
+        Unterhalb dieses Wertes wird die Batterie nicht entladen.
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: slider
+
+    max_soc:
+      name: "Maximaler SOC (%)"
+      description: >
+        Maximaler Batterie-Ladezustand in Prozent.
+        Oberhalb dieses Wertes wird die Batterie nicht mehr geladen.
+      default: 100
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: slider
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  grid_power_entity: !input grid_power_sensor
+  soc_entity: !input battery_soc_sensor
+  discharge_entity: !input discharge_power_number
+  charge_entity: !input charge_power_number
+  zero_feed_in_entity: !input zero_feed_in_enabled
+  manual_feed_in_entity: !input manual_feed_in_enabled
+  manual_power_entity: !input manual_discharge_power
+  max_feed_in_value: !input max_grid_feed_in
+  max_discharge_value: !input max_discharge_power
+  max_charge_value: !input max_charge_power
+  min_soc_value: !input min_soc
+  max_soc_value: !input max_soc
+
+trigger:
+  - platform: state
+    entity_id: !input grid_power_sensor
+  - platform: time_pattern
+    minutes: "/1"
+
+condition:
+  - condition: or
+    conditions:
+      - condition: state
+        entity_id: !input zero_feed_in_enabled
+        state: "on"
+      - condition: state
+        entity_id: !input manual_feed_in_enabled
+        state: "on"
+  - condition: template
+    value_template: >
+      {{ states(grid_power_entity) not in ['unknown', 'unavailable'] and
+         states(soc_entity) not in ['unknown', 'unavailable'] }}
+
+action:
+  - delay:
+      seconds: 3
+
+  - choose:
+      - conditions:
+          - condition: state
+            entity_id: !input manual_feed_in_enabled
+            state: "on"
+        sequence:
+          - variables:
+              manual_power: "{{ states(manual_power_entity) | float(0) }}"
+              soc: "{{ states(soc_entity) | float(0) }}"
+              effective_discharge: >
+                {% if soc <= min_soc_value %}
+                  {{ 0 }}
+                {% else %}
+                  {{ [manual_power | float(0), max_discharge_value | float(0)] | min }}
+                {% endif %}
+          - service: number.set_value
+            target:
+              entity_id: !input charge_power_number
+            data:
+              value: 0
+          - service: number.set_value
+            target:
+              entity_id: !input discharge_power_number
+            data:
+              value: "{{ effective_discharge | int(0) }}"
+
+      - conditions:
+          - condition: state
+            entity_id: !input zero_feed_in_enabled
+            state: "on"
+        sequence:
+          - variables:
+              grid: "{{ states(grid_power_entity) | float(0) }}"
+              soc: "{{ states(soc_entity) | float(0) }}"
+              current_discharge: "{{ states(discharge_entity) | float(0) }}"
+              current_charge: "{{ states(charge_entity) | float(0) }}"
+              current_net: "{{ current_discharge | float(0) - current_charge | float(0) }}"
+              import_tolerance: 10
+              new_net: >
+                {% set g = grid | float(0) %}
+                {% set net = current_net | float(0) %}
+                {% set feed_in = max_feed_in_value | float(0) %}
+                {% if g > import_tolerance %}
+                  {{ net + g }}
+                {% elif g < (-feed_in) %}
+                  {{ net + g + feed_in }}
+                {% else %}
+                  {{ net }}
+                {% endif %}
+              discharge_target: >
+                {% set net = new_net | float(0) %}
+                {% set s = soc | float(0) %}
+                {% if net > 0 %}
+                  {% if s <= min_soc_value | float(10) %}
+                    {{ 0 }}
+                  {% else %}
+                    {{ [net, max_discharge_value | float(800)] | min }}
+                  {% endif %}
+                {% else %}
+                  {{ 0 }}
+                {% endif %}
+              charge_target: >
+                {% set net = new_net | float(0) %}
+                {% set s = soc | float(0) %}
+                {% if net < 0 %}
+                  {% if s >= max_soc_value | float(100) %}
+                    {{ 0 }}
+                  {% else %}
+                    {{ [net | abs, max_charge_value | float(800)] | min }}
+                  {% endif %}
+                {% else %}
+                  {{ 0 }}
+                {% endif %}
+          - service: number.set_value
+            target:
+              entity_id: !input discharge_power_number
+            data:
+              value: "{{ discharge_target | int(0) }}"
+          - service: number.set_value
+            target:
+              entity_id: !input charge_power_number
+            data:
+              value: "{{ charge_target | int(0) }}"
