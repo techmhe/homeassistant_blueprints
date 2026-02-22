@@ -141,8 +141,8 @@ blueprint:
       selector:
         number:
           min: 0
-          max: 200
-          step: 5
+          max: 500
+          step: 10
           unit_of_measurement: "W"
           mode: slider
 
@@ -170,7 +170,7 @@ blueprint:
         number:
           min: 0
           max: 800
-          step: 10
+          step: 50
           unit_of_measurement: "W"
           mode: slider
 
@@ -182,7 +182,7 @@ blueprint:
         number:
           min: 0
           max: 1200
-          step: 10
+          step: 50
           unit_of_measurement: "W"
           mode: slider
 
@@ -240,7 +240,7 @@ blueprint:
       selector:
         number:
           min: 50
-          max: 800
+          max: 400
           step: 50
           unit_of_measurement: "W"
           mode: slider
