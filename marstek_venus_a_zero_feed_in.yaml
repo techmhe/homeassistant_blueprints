@@ -1,3 +1,29 @@
+###############################################################################
+# Marstek Venus A – Nulleinspeisung (Zero Feed-In) Blueprint
+#
+# Controls a Marstek Venus A battery storage via Modbus integration
+# to achieve zero grid feed-in. Uses a power meter (e.g. Shelly Pro3 EM)
+# at the grid connection point and automatically adjusts charge/discharge
+# power so that minimal or no power is exported to the grid.
+#
+# Control algorithm overview (proportional controller with dead band):
+#   1. Read grid power (positive = import, negative = export)
+#   2. Read current battery command values (discharge/charge power settings)
+#   3. Compute "current_net" = discharge_setting - charge_setting
+#      (positive = battery discharging, negative = battery charging)
+#   4. If grid is outside the dead band [target - max_feed_in, target + 10]:
+#        new_net = current_net + grid - target
+#      This adjusts battery power to bring grid towards the target import.
+#   5. Split new_net into discharge (if > 0) or charge (if < 0) targets
+#   6. Apply SOC limits, power limits, ramp-up for discharge
+#   7. Set power values and force mode via Modbus
+#
+# Debugging:
+#   - All key variables appear in Home Assistant automation traces
+#   - A "debug_message" variable summarizes each cycle for easy trace analysis
+#   - system_log.write entries are created for mode changes and errors
+###############################################################################
+
 blueprint:
   name: "Marstek Venus A – Nulleinspeisung (Zero Feed-In)"
   description: >
@@ -65,6 +91,8 @@ blueprint:
         Sensor für die aktuelle PV-Eingangsleistung (Solarleistung) in Watt.
         Wird benötigt, um zu bestimmen, ob PV-Überschuss vorhanden ist
         und der Force Mode korrekt auf 'laden' gesetzt werden soll.
+        Hinweis: Wenn dieser Sensor nachts 'unavailable' wird, funktioniert
+        die Nulleinspeisung trotzdem weiter (PV wird dann als 0 W behandelt).
       selector:
         entity:
           filter:
@@ -256,10 +284,17 @@ blueprint:
           filter:
             domain: select
 
+# Only one instance of this automation runs at a time.
+# If a new trigger fires while the automation is still running, it is silently
+# ignored (no warning in the log). This prevents overlapping Modbus writes.
 mode: single
 max_exceeded: silent
 
+###############################################################################
+# Variables – store all input references for use in Jinja2 templates
+###############################################################################
 variables:
+  # Entity IDs (resolved from blueprint inputs at instantiation time)
   grid_power_entity: !input grid_power_sensor
   pv_power_entity: !input pv_power_sensor
   soc_entity: !input battery_soc_sensor
@@ -268,6 +303,8 @@ variables:
   zero_feed_in_entity: !input zero_feed_in_enabled
   manual_feed_in_entity: !input manual_feed_in_enabled
   manual_power_entity: !input manual_discharge_power
+  force_mode_entity: !input force_mode_select
+  # Numeric configuration values
   min_grid_import_value: !input min_grid_import
   max_feed_in_value: !input max_grid_feed_in
   max_discharge_value: !input max_discharge_power
@@ -276,137 +313,232 @@ variables:
   max_soc_value: !input max_soc
   discharge_delay_value: !input discharge_delay
   discharge_step_value: !input discharge_step
-  force_mode_entity: !input force_mode_select
 
+###############################################################################
+# Triggers
+###############################################################################
 trigger:
+  # React immediately when the grid power reading changes
   - platform: state
     entity_id: !input grid_power_sensor
+  # React when PV power changes (e.g. cloud cover)
   - platform: state
     entity_id: !input pv_power_sensor
+  # Periodic fallback: run every 10 seconds even if no state change occurs
   - platform: time_pattern
     seconds: "/10"
+  # When the user turns OFF zero-feed-in, we need to stop the battery
   - platform: state
     entity_id: !input zero_feed_in_enabled
     to: "off"
+  # When the user turns OFF manual feed-in, we need to stop the battery
   - platform: state
     entity_id: !input manual_feed_in_enabled
     to: "off"
 
+###############################################################################
+# Conditions – the automation only runs if at least one mode is active
+# OR the trigger was an explicit "turn off" of a mode toggle
+###############################################################################
 condition:
   - condition: or
     conditions:
+      # Run if zero-feed-in is enabled
       - condition: state
         entity_id: !input zero_feed_in_enabled
         state: "on"
+      # Run if manual feed-in is enabled
       - condition: state
         entity_id: !input manual_feed_in_enabled
         state: "on"
+      # Run if the trigger was one of the mode toggles being turned off
+      # (so we can execute the "default" stop action)
       - condition: template
         value_template: >
           {{ trigger.entity_id is defined and
              (trigger.entity_id == zero_feed_in_entity or
               trigger.entity_id == manual_feed_in_entity) }}
+  # Grid power and SOC sensors must be available.
+  # PV sensor is NOT required here – it may be unavailable at night when the
+  # solar inverter is off. The templates treat unavailable PV as 0 W.
+  # This is a critical fix: previously, an unavailable PV sensor blocked the
+  # entire automation, preventing battery discharge at night.
   - condition: template
     value_template: >
       {{ states(grid_power_entity) not in ['unknown', 'unavailable'] and
-         states(soc_entity) not in ['unknown', 'unavailable'] and
-         states(pv_power_entity) not in ['unknown', 'unavailable'] }}
+         states(soc_entity) not in ['unknown', 'unavailable'] }}
 
+###############################################################################
+# Actions – choose between manual feed-in, zero feed-in, or stop (default)
+###############################################################################
 action:
   - choose:
+      #####################################################################
+      # Branch 1: MANUAL FEED-IN (has priority over zero feed-in)
+      # Discharges the battery at a user-specified fixed power level.
+      #####################################################################
       - conditions:
           - condition: state
             entity_id: !input manual_feed_in_enabled
             state: "on"
         sequence:
           - variables:
+              # Read the user's desired manual discharge power (W)
               manual_power: "{{ states(manual_power_entity) | float(0) }}"
+              # Current battery state of charge (%)
               soc: "{{ states(soc_entity) | float(0) }}"
+              # Calculate effective discharge:
+              # - If SOC is at or below minimum, do not discharge (protect battery)
+              # - Otherwise, use manual power capped at the configured maximum
               effective_discharge: >
-                {% if soc <= min_soc_value | float(0) %}
+                {%- if soc <= min_soc_value | float(0) -%}
                   {{ 0 }}
-                {% else %}
-                  {{ [manual_power | float(0), max_discharge_value | float(0)] | min }}
-                {% endif %}
+                {%- else -%}
+                  {{ [manual_power, max_discharge_value | float(0)] | min }}
+                {%- endif -%}
+              # Determine the force mode based on effective discharge
+              force_mode_option: >
+                {%- if effective_discharge | float(0) > 0 -%}
+                  discharge
+                {%- else -%}
+                  stop
+                {%- endif -%}
+              # Debug summary visible in HA automation traces
+              debug_message: >
+                MANUAL: SOC={{ soc }}%, manual_power={{ manual_power }}W,
+                effective_discharge={{ effective_discharge }}W,
+                force_mode={{ force_mode_option }}
+
+          # Log the action for debugging
+          - service: system_log.write
+            data:
+              message: "Nulleinspeisung [MANUAL]: {{ debug_message }}"
+              level: info
+              logger: "blueprint.marstek_nulleinspeisung"
+
+          # Set charge power to 0 (manual mode only discharges)
           - service: number.set_value
             target:
               entity_id: !input charge_power_number
             data:
               value: 0
-              
+
+          # Set the discharge power
           - service: number.set_value
             target:
               entity_id: !input discharge_power_number
             data:
               value: "{{ effective_discharge | round(0) | int }}"
-              
+
+          # Set the force mode (discharge or stop)
           - service: select.select_option
             target:
               entity_id: !input force_mode_select
             data:
-              option: >
-                {% if effective_discharge | round(0) | int > 0 %}
-                  discharge
-                {% else %}
-                  stop
-                {% endif %}
+              option: "{{ force_mode_option }}"
 
+      #####################################################################
+      # Branch 2: AUTOMATIC ZERO FEED-IN (Nulleinspeisung)
+      # Calculates the optimal battery power to keep grid import at the
+      # configured target (min_grid_import) with minimal export.
+      #####################################################################
       - conditions:
           - condition: state
             entity_id: !input zero_feed_in_enabled
             state: "on"
         sequence:
+          ############################
+          # Step 1: Read current state
+          ############################
           - variables:
+              # Current grid power: positive = import, negative = export (W)
               grid: "{{ states(grid_power_entity) | float(0) }}"
-              pv_power: "{{ states(pv_power_entity) | float(0) }}"
+              # Current PV power; treat unavailable as 0 W (safe for nighttime)
+              pv_power: >
+                {% set pv_raw = states(pv_power_entity) %}
+                {{ pv_raw | float(0) if pv_raw not in ['unknown', 'unavailable'] else 0 }}
+              # Battery state of charge (%)
               soc: "{{ states(soc_entity) | float(0) }}"
-              current_discharge: "{{ states(discharge_entity) | float(0) }}"
-              current_charge: "{{ states(charge_entity) | float(0) }}"
+              # Current commanded discharge power from the Modbus entity (W)
+              # This is the last value we set, not the actual battery output.
+              # We treat unavailable as 0 to avoid stale values causing issues.
+              current_discharge: >
+                {% set raw = states(discharge_entity) %}
+                {{ raw | float(0) if raw not in ['unknown', 'unavailable'] else 0 }}
+              # Current commanded charge power from the Modbus entity (W)
+              current_charge: >
+                {% set raw = states(charge_entity) %}
+                {{ raw | float(0) if raw not in ['unknown', 'unavailable'] else 0 }}
+
+          #######################################
+          # Step 2: Calculate new battery targets
+          #######################################
+          - variables:
+              # Net battery power: positive = discharging, negative = charging
+              # This represents what we last told the battery to do.
               current_net: "{{ current_discharge | float(0) - current_charge | float(0) }}"
+              # Target grid import power (W) – the setpoint for the controller
               target_import: "{{ min_grid_import_value | float(0) }}"
+              # Fixed tolerance for the upper dead band edge (W)
               tolerance: 10
+              # Dead band boundaries:
+              # lower_bound = target - max_feed_in  (how much export we tolerate)
+              # upper_bound = target + tolerance     (how much extra import we tolerate)
+              # When grid is within [lower_bound, upper_bound], no adjustment is made.
               lower_bound: "{{ target_import | float(0) - max_feed_in_value | float(0) }}"
               upper_bound: "{{ target_import | float(0) + tolerance }}"
+              # Calculate the new desired net battery power.
+              # Formula: new_net = current_net + grid - target
+              # Intuition: if grid > target (importing too much), increase discharge.
+              #            if grid < lower_bound (exporting too much), increase charge.
+              #            if grid is within dead band, keep current setting.
               new_net: >
-                {% set g = grid | float(0) %}
-                {% set net = current_net | float(0) %}
-                {% set target = target_import | float(0) %}
-                {% set lo = lower_bound | float(0) %}
-                {% set hi = upper_bound | float(0) %}
-                {% if g > hi or g < lo %}
-                  {{ net + g - target }}
-                {% else %}
+                {%- set g = grid | float(0) -%}
+                {%- set net = current_net | float(0) -%}
+                {%- set lo = lower_bound | float(0) -%}
+                {%- set hi = upper_bound | float(0) -%}
+                {%- if g > hi or g < lo -%}
+                  {{ net + g - target_import | float(0) }}
+                {%- else -%}
                   {{ net }}
-                {% endif %}
+                {%- endif -%}
+              # Discharge target: how much to discharge (W), 0 if net <= 0
+              # Respects SOC minimum and max discharge power limits
               discharge_target: >
-                {% set net = new_net | float(0) %}
-                {% set s = soc | float(0) %}
-                {% if net > 0 %}
-                  {% if s <= min_soc_value | float(0) %}
+                {%- set net = new_net | float(0) -%}
+                {%- if net > 0 -%}
+                  {%- if soc | float(0) <= min_soc_value | float(0) -%}
                     {{ 0 }}
-                  {% else %}
+                  {%- else -%}
                     {{ [net, max_discharge_value | float(0)] | min }}
-                  {% endif %}
-                {% else %}
+                  {%- endif -%}
+                {%- else -%}
                   {{ 0 }}
-                {% endif %}
+                {%- endif -%}
+              # Charge target: how much to charge (W), 0 if net >= 0
+              # Respects SOC maximum and max charge power limits
               charge_target: >
-                {% set net = new_net | float(0) %}
-                {% set s = soc | float(0) %}
-                {% if net < 0 %}
-                  {% if s >= max_soc_value | float(0) %}
+                {%- set net = new_net | float(0) -%}
+                {%- if net < 0 -%}
+                  {%- if soc | float(0) >= max_soc_value | float(0) -%}
                     {{ 0 }}
-                  {% else %}
+                  {%- else -%}
                     {{ [net | abs, max_charge_value | float(0)] | min }}
-                  {% endif %}
-                {% else %}
+                  {%- endif -%}
+                {%- else -%}
                   {{ 0 }}
-                {% endif %}
+                {%- endif -%}
+              # Detect if we are starting a discharge from a completely idle state.
+              # If so, we will apply the discharge delay to filter short load spikes.
               starting_discharge: >
                 {{ discharge_target | float(0) > 0 and
                    current_discharge | float(0) == 0 and
                    current_charge | float(0) == 0 }}
 
+          ############################################################
+          # Step 3: Discharge delay – wait before starting a discharge
+          # from idle state to filter transient load spikes
+          ############################################################
           - if:
               - condition: template
                 value_template: "{{ starting_discharge }}"
@@ -414,83 +546,165 @@ action:
               - delay:
                   seconds: "{{ discharge_delay_value | int(0) }}"
 
+          ##############################################################
+          # Step 4: Re-read sensor values after the delay (if any).
+          # The grid power and battery state may have changed during the
+          # delay, so we recalculate everything with fresh data.
+          ##############################################################
           - variables:
+              # Fresh grid power reading after potential delay
               grid_current: "{{ states(grid_power_entity) | float(0) }}"
+              # Fresh SOC reading
               soc_current: "{{ states(soc_entity) | float(0) }}"
-              current_discharge_actual: "{{ states(discharge_entity) | float(0) }}"
-              current_charge_actual: "{{ states(charge_entity) | float(0) }}"
-              current_net_actual: "{{ current_discharge_actual | float(0) - current_charge_actual | float(0) }}"
-              new_net_final: >
-                {% set g = grid_current | float(0) %}
-                {% set net = current_net_actual | float(0) %}
-                {% set target = target_import | float(0) %}
-                {% set lo = lower_bound | float(0) %}
-                {% set hi = upper_bound | float(0) %}
-                {% if g > hi or g < lo %}
-                  {{ net + g - target }}
-                {% else %}
-                  {{ net }}
-                {% endif %}
-              discharge_target_final: >
-                {% set net = new_net_final | float(0) %}
-                {% set s = soc_current | float(0) %}
-                {% if net > 0 %}
-                  {% if s <= min_soc_value | float(0) %}
-                    {{ 0 }}
-                  {% else %}
-                    {{ [net, max_discharge_value | float(0)] | min }}
-                  {% endif %}
-                {% else %}
-                  {{ 0 }}
-                {% endif %}
-              charge_target_final: >
-                {% set net = new_net_final | float(0) %}
-                {% set s = soc_current | float(0) %}
-                {% if net < 0 %}
-                  {% if s >= max_soc_value | float(0) %}
-                    {{ 0 }}
-                  {% else %}
-                    {{ [net | abs, max_charge_value | float(0)] | min }}
-                  {% endif %}
-                {% else %}
-                  {{ 0 }}
-                {% endif %}
-              ramped_discharge: >
-                {% set target = discharge_target_final | float(0) %}
-                {% set current = current_discharge_actual | float(0) %}
-                {% set step = discharge_step_value | float(0) %}
-                {% if target > current %}
-                  {{ [target, current + step] | min }}
-                {% else %}
-                  {{ target }}
-                {% endif %}
+              # Fresh PV power reading (treat unavailable as 0)
+              pv_current: >
+                {% set pv_raw = states(pv_power_entity) %}
+                {{ pv_raw | float(0) if pv_raw not in ['unknown', 'unavailable'] else 0 }}
+              # Fresh commanded discharge power (treat unavailable as 0)
+              current_discharge_actual: >
+                {% set raw = states(discharge_entity) %}
+                {{ raw | float(0) if raw not in ['unknown', 'unavailable'] else 0 }}
+              # Fresh commanded charge power (treat unavailable as 0)
+              current_charge_actual: >
+                {% set raw = states(charge_entity) %}
+                {{ raw | float(0) if raw not in ['unknown', 'unavailable'] else 0 }}
 
-          - service: number.set_value
-            target:
-              entity_id: !input discharge_power_number
+          #################################################
+          # Step 5: Recalculate targets with fresh data
+          #################################################
+          - variables:
+              # Recalculate net battery power with fresh values
+              current_net_actual: "{{ current_discharge_actual | float(0) - current_charge_actual | float(0) }}"
+              # Recalculate new_net with fresh grid reading
+              new_net_final: >
+                {%- set g = grid_current | float(0) -%}
+                {%- set net = current_net_actual | float(0) -%}
+                {%- set lo = lower_bound | float(0) -%}
+                {%- set hi = upper_bound | float(0) -%}
+                {%- if g > hi or g < lo -%}
+                  {{ net + g - target_import | float(0) }}
+                {%- else -%}
+                  {{ net }}
+                {%- endif -%}
+              # Final discharge target with fresh SOC
+              discharge_target_final: >
+                {%- set net = new_net_final | float(0) -%}
+                {%- if net > 0 -%}
+                  {%- if soc_current | float(0) <= min_soc_value | float(0) -%}
+                    {{ 0 }}
+                  {%- else -%}
+                    {{ [net, max_discharge_value | float(0)] | min }}
+                  {%- endif -%}
+                {%- else -%}
+                  {{ 0 }}
+                {%- endif -%}
+              # Final charge target with fresh SOC
+              charge_target_final: >
+                {%- set net = new_net_final | float(0) -%}
+                {%- if net < 0 -%}
+                  {%- if soc_current | float(0) >= max_soc_value | float(0) -%}
+                    {{ 0 }}
+                  {%- else -%}
+                    {{ [net | abs, max_charge_value | float(0)] | min }}
+                  {%- endif -%}
+                {%- else -%}
+                  {{ 0 }}
+                {%- endif -%}
+              # Apply ramp-up to discharge: limit increase per cycle by discharge_step.
+              # Ramp-down is immediate (no step limit when reducing discharge).
+              ramped_discharge: >
+                {%- set target = discharge_target_final | float(0) -%}
+                {%- set current = current_discharge_actual | float(0) -%}
+                {%- set step = discharge_step_value | float(0) -%}
+                {%- if target > current -%}
+                  {{ [target, current + step] | min }}
+                {%- else -%}
+                  {{ target }}
+                {%- endif -%}
+              # Determine force mode:
+              # - "discharge" if we have a positive discharge target
+              # - "charge" if we have a positive charge target AND PV is producing
+              #   (we only charge when PV is available to avoid charging from grid)
+              # - "stop" otherwise (idle)
+              force_mode_option: >
+                {%- if ramped_discharge | float(0) > 0 -%}
+                  discharge
+                {%- elif charge_target_final | float(0) > 0 and pv_current | float(0) > 0 -%}
+                  charge
+                {%- else -%}
+                  stop
+                {%- endif -%}
+              # Debug summary for HA trace analysis – all key values in one place
+              debug_message: >
+                ZERO-FEED-IN: grid={{ grid_current }}W, PV={{ pv_current }}W,
+                SOC={{ soc_current }}%, current_D={{ current_discharge_actual }}W,
+                current_C={{ current_charge_actual }}W, net={{ current_net_actual }}W,
+                dead_band=[{{ lower_bound }},{{ upper_bound }}],
+                new_net={{ new_net_final }}W, D_target={{ discharge_target_final }}W,
+                C_target={{ charge_target_final }}W, ramped_D={{ ramped_discharge }}W,
+                mode={{ force_mode_option }}
+
+          ###########################################################
+          # Step 6: Apply the calculated values to the Marstek Venus
+          ###########################################################
+
+          # Log the debug summary for easy troubleshooting
+          - service: system_log.write
             data:
-              value: "{{ ramped_discharge | round(0) | int }}"
-              
-          - service: number.set_value
-            target:
-              entity_id: !input charge_power_number
-            data:
-              value: "{{ charge_target_final | round(0) | int }}"
-              
+              message: "Nulleinspeisung {{ debug_message }}"
+              level: info
+              logger: "blueprint.marstek_nulleinspeisung"
+
+          # Set charge power to 0 first when discharging (clean transition)
+          # Set discharge power to 0 first when charging (clean transition)
+          # This ensures the "opposing" power is zeroed before the new mode takes
+          # effect, preventing brief unwanted charge/discharge during transitions.
+          - if:
+              - condition: template
+                value_template: "{{ force_mode_option == 'discharge' }}"
+            then:
+              # Discharging: zero out charge first, then set discharge
+              - service: number.set_value
+                target:
+                  entity_id: !input charge_power_number
+                data:
+                  value: 0
+              - service: number.set_value
+                target:
+                  entity_id: !input discharge_power_number
+                data:
+                  value: "{{ ramped_discharge | round(0) | int }}"
+            else:
+              # Charging or stopping: zero out discharge first, then set charge
+              - service: number.set_value
+                target:
+                  entity_id: !input discharge_power_number
+                data:
+                  value: "{{ ramped_discharge | round(0) | int }}"
+              - service: number.set_value
+                target:
+                  entity_id: !input charge_power_number
+                data:
+                  value: "{{ charge_target_final | round(0) | int }}"
+
+          # Set the force mode last – the power values are already set correctly
           - service: select.select_option
             target:
               entity_id: !input force_mode_select
             data:
-              option: >
-                {% if ramped_discharge | round(0) | int > 0 %}
-                  discharge
-                {% elif charge_target_final | round(0) | int > 0 and states(pv_power_entity) | float(0) > 0 %}
-                  charge
-                {% else %}
-                  stop
-                {% endif %}
+              option: "{{ force_mode_option }}"
 
+    ###################################################################
+    # Default: STOP – runs when both modes are turned off
+    # Resets the battery to idle state (no charging, no discharging)
+    ###################################################################
     default:
+      - service: system_log.write
+        data:
+          message: >-
+            Nulleinspeisung [STOP]: Both modes disabled, stopping battery.
+          level: info
+          logger: "blueprint.marstek_nulleinspeisung"
       - service: number.set_value
         target:
           entity_id: !input discharge_power_number
