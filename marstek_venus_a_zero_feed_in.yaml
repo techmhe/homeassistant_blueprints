@@ -11,7 +11,7 @@
 #   2. Read current battery command values (discharge/charge power settings)
 #   3. Compute "current_net" = discharge_setting - charge_setting
 #      (positive = battery discharging, negative = battery charging)
-#   4. If grid is outside the dead band [target - max_feed_in, target + 10]:
+#   4. If grid is outside the dead band [target - tolerance, target + tolerance]:
 #        new_net = current_net + grid - target
 #      This adjusts battery power to bring grid towards the target import.
 #   5. Split new_net into discharge (if > 0) or charge (if < 0) targets
@@ -482,10 +482,13 @@ action:
               # Fixed tolerance for the upper dead band edge (W)
               tolerance: 10
               # Dead band boundaries:
-              # lower_bound = target - max_feed_in  (how much export we tolerate)
-              # upper_bound = target + tolerance     (how much extra import we tolerate)
+              # lower_bound = target - tolerance  (symmetric around target)
+              # upper_bound = target + tolerance
               # When grid is within [lower_bound, upper_bound], no adjustment is made.
-              lower_bound: "{{ target_import | float(0) - max_feed_in_value | float(0) }}"
+              # Using symmetric tolerance prevents the dead band from becoming too
+              # wide, which could cause the discharge to stay stuck at a high value
+              # when the load drops suddenly.
+              lower_bound: "{{ target_import | float(0) - tolerance }}"
               upper_bound: "{{ target_import | float(0) + tolerance }}"
               # Calculate the new desired net battery power.
               # Formula: new_net = current_net + grid - target

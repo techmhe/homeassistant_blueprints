@@ -219,7 +219,7 @@ def run_zero_feed_in(
     ctx["target_import"] = target_import
     tolerance = 10
     ctx["tolerance"] = tolerance
-    lower_bound = target_import - float(ctx["max_feed_in_value"])
+    lower_bound = target_import - tolerance
     upper_bound = target_import + tolerance
     ctx["lower_bound"] = lower_bound
     ctx["upper_bound"] = upper_bound
@@ -376,15 +376,15 @@ class TestZeroFeedInBasicScenarios:
         # 0 is at the lower_bound=0 boundary, which is NOT < 0, so it's within dead band
         assert result["new_net"] == 500.0  # keep current
 
-    def test_grid_slightly_negative_adjusts(self):
-        """Grid at -5W (just below lower_bound=0) → should adjust."""
+    def test_grid_slightly_negative_within_band(self):
+        """Grid at -5W (within [-10, 10] dead band) → no adjustment."""
         result = run_zero_feed_in(
             grid=-5, pv=0, soc=80,
             discharge_setting=500, charge_setting=0
         )
-        # -5 < 0 → adjust: new_net = 500 + (-5) - 0 = 495
-        assert result["new_net"] == 495.0
-        assert result["discharge_target"] == 495.0
+        # -5 is within [-10, 10] dead band → keep current
+        assert result["new_net"] == 500.0
+        assert result["discharge_target"] == 500.0
 
     def test_battery_fully_discharging_grid_near_zero(self):
         """Battery discharging 500W, grid at 0W → maintain state."""
@@ -510,7 +510,7 @@ class TestDeadBand:
     """Test the dead band (tolerance) behavior."""
 
     def test_within_dead_band_default(self):
-        """Grid 5W, target 0, dead band [0, 10] → no change."""
+        """Grid 5W, target 0, dead band [-10, 10] → no change."""
         result = run_zero_feed_in(
             grid=5, pv=0, soc=80,
             discharge_setting=200, charge_setting=0
@@ -527,33 +527,33 @@ class TestDeadBand:
         assert result["new_net"] == 215.0
 
     def test_below_dead_band(self):
-        """Grid -5W, target 0, dead band [0, 10] → adjust."""
+        """Grid -15W, target 0, dead band [-10, 10] → adjust."""
         result = run_zero_feed_in(
-            grid=-5, pv=0, soc=80,
+            grid=-15, pv=0, soc=80,
             discharge_setting=200, charge_setting=0
         )
-        # -5 < 0 → new_net = 200 + (-5) - 0 = 195
-        assert result["new_net"] == 195.0
+        # -15 < -10 → new_net = 200 + (-15) - 0 = 185
+        assert result["new_net"] == 185.0
 
-    def test_custom_target_and_feed_in(self):
-        """Custom target=50, max_feed_in=20 → dead band [30, 60]."""
+    def test_custom_target_dead_band(self):
+        """Custom target=50 → dead band [40, 60]."""
         result = run_zero_feed_in(
             grid=45, pv=0, soc=80,
             discharge_setting=200, charge_setting=0,
-            config={"min_grid_import_value": 50, "max_feed_in_value": 20}
+            config={"min_grid_import_value": 50}
         )
-        # dead band = [50-20, 50+10] = [30, 60]
-        # grid=45 is within [30, 60] → no change
-        assert result["lower_bound"] == 30.0
+        # dead band = [50-10, 50+10] = [40, 60]
+        # grid=45 is within [40, 60] → no change
+        assert result["lower_bound"] == 40.0
         assert result["upper_bound"] == 60.0
         assert result["new_net"] == 200.0
 
     def test_custom_target_above_band(self):
-        """Custom target=50, grid=70, dead band [30, 60] → adjust."""
+        """Custom target=50, grid=70, dead band [40, 60] → adjust."""
         result = run_zero_feed_in(
             grid=70, pv=0, soc=80,
             discharge_setting=200, charge_setting=0,
-            config={"min_grid_import_value": 50, "max_feed_in_value": 20}
+            config={"min_grid_import_value": 50}
         )
         # 70 > 60 → new_net = 200 + 70 - 50 = 220
         assert result["new_net"] == 220.0
@@ -906,6 +906,46 @@ class TestEdgeCases:
         # PV=-10 is a valid float, so pv_power=-10. Force mode check: pv > 0 → false
         assert result["pv_power"] == -10.0
         assert result["force_mode"] == "discharge"  # discharge, not charge
+
+    def test_large_max_feed_in_does_not_prevent_discharge_reduction(self):
+        """Regression: large max_feed_in should not prevent discharge reduction.
+
+        Previously, max_feed_in_value was used for the dead band lower bound,
+        causing the dead band to become [-800, 10] when max_feed_in=800. This
+        meant the controller never reduced discharge when exporting to grid.
+        """
+        # Scenario from issue: discharging 570W, grid at -204W (exporting)
+        result = run_zero_feed_in(
+            grid=-204.3, pv=0, soc=41,
+            discharge_setting=570, charge_setting=0,
+            config={"max_feed_in_value": 800}
+        )
+        # Grid at -204.3 is outside dead band [-10, 10] → must adjust
+        # new_net = 570 + (-204.3) - 0 = 365.7
+        assert abs(result["new_net"] - 365.7) < 0.1
+        assert abs(result["discharge_target"] - 365.7) < 0.1
+        # Ramp-down is immediate: target < current
+        assert abs(result["ramped_discharge"] - 365.7) < 0.1
+        assert result["force_mode"] == "discharge"
+
+    def test_discharge_stuck_at_max_after_load_drop(self):
+        """Regression: discharge at max should reduce when load drops.
+
+        Simulates: load was 800W → discharge=800, then load drops to 200W.
+        Grid becomes -600W (exporting). Controller must reduce discharge.
+        """
+        result = run_zero_feed_in(
+            grid=-600, pv=0, soc=80,
+            discharge_setting=800, charge_setting=0,
+            config={"max_feed_in_value": 800}
+        )
+        # Grid at -600 is outside [-10, 10] → adjust
+        # new_net = 800 + (-600) - 0 = 200
+        assert result["new_net"] == 200.0
+        assert result["discharge_target"] == 200.0
+        # Ramp-down is immediate
+        assert result["ramped_discharge"] == 200.0
+        assert result["force_mode"] == "discharge"
 
 
 if __name__ == "__main__":
