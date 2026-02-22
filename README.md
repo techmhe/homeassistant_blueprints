@@ -125,7 +125,7 @@ Wenn Netzimport oberhalb Totzone:
 
 Wenn Netzexport unterhalb Totzone:
     → Entladeleistung reduzieren oder Batterie laden (sofort)
-    → Force Mode = laden (nur wenn PV-Eingangsleistung > 0)
+    → Force Mode = laden (nur wenn PV-Eingangsleistung > 0 und Ladeziel > 0)
 
 Wenn innerhalb Totzone:
     → Keine Änderung (Oszillation vermeiden)
