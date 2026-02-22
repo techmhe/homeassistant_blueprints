@@ -25,6 +25,9 @@ blueprint:
 
     - Schrittweise Entladung (Rampe) zum Schutz der Hardware
 
+    - Automatische Force-Mode-Steuerung basierend auf PV-Eingangsleistung
+      (laden bei PV-Überschuss, entladen bei Netzbezug)
+
 
     Voraussetzungen:
 
@@ -32,6 +35,8 @@ blueprint:
       (https://github.com/ViperRNMC/marstek_venus_modbus)
 
     - Leistungsmesser am Netzanschluss (z.B. Shelly Pro3 EM)
+
+    - PV-Eingangsleistungs-Sensor (Solarleistung)
 
     - Zwei Input-Boolean-Helfer (Nulleinspeisung ein/aus, Manuelle Einspeisung ein/aus)
 
@@ -48,6 +53,18 @@ blueprint:
       description: >
         Sensor für die aktuelle Netzleistung (z.B. Shelly Pro3 EM).
         Positiv = Netzbezug, Negativ = Netzeinspeisung.
+      selector:
+        entity:
+          filter:
+            domain: sensor
+            device_class: power
+
+    pv_power_sensor:
+      name: "PV-Eingangsleistung Sensor"
+      description: >
+        Sensor für die aktuelle PV-Eingangsleistung (Solarleistung) in Watt.
+        Wird benötigt, um zu bestimmen, ob PV-Überschuss vorhanden ist
+        und der Force Mode korrekt auf 'laden' gesetzt werden soll.
       selector:
         entity:
           filter:
@@ -244,6 +261,7 @@ max_exceeded: silent
 
 variables:
   grid_power_entity: !input grid_power_sensor
+  pv_power_entity: !input pv_power_sensor
   soc_entity: !input battery_soc_sensor
   discharge_entity: !input discharge_power_number
   charge_entity: !input charge_power_number
@@ -263,6 +281,8 @@ variables:
 trigger:
   - platform: state
     entity_id: !input grid_power_sensor
+  - platform: state
+    entity_id: !input pv_power_sensor
   - platform: time_pattern
     seconds: "/10"
 
@@ -278,7 +298,8 @@ condition:
   - condition: template
     value_template: >
       {{ states(grid_power_entity) not in ['unknown', 'unavailable'] and
-         states(soc_entity) not in ['unknown', 'unavailable'] }}
+         states(soc_entity) not in ['unknown', 'unavailable'] and
+         states(pv_power_entity) not in ['unknown', 'unavailable'] }}
 
 action:
   - choose:
@@ -324,6 +345,7 @@ action:
         sequence:
           - variables:
               grid: "{{ states(grid_power_entity) | float(0) }}"
+              pv_power: "{{ states(pv_power_entity) | float(0) }}"
               soc: "{{ states(soc_entity) | float(0) }}"
               current_discharge: "{{ states(discharge_entity) | float(0) }}"
               current_charge: "{{ states(charge_entity) | float(0) }}"
@@ -380,6 +402,7 @@ action:
                   seconds: "{{ discharge_delay_value | int(0) }}"
               - variables:
                   grid: "{{ states(grid_power_entity) | float(0) }}"
+                  pv_power: "{{ states(pv_power_entity) | float(0) }}"
                   soc: "{{ states(soc_entity) | float(0) }}"
                   current_discharge: "{{ states(discharge_entity) | float(0) }}"
                   current_charge: "{{ states(charge_entity) | float(0) }}"
@@ -448,7 +471,7 @@ action:
               option: >
                 {% if ramped_discharge | int(0) > 0 %}
                   entladen
-                {% elif charge_target | int(0) > 0 %}
+                {% elif charge_target | int(0) > 0 and pv_power | float(0) > 0 %}
                   laden
                 {% else %}
                   halt
