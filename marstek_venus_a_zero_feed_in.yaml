@@ -319,12 +319,14 @@ action:
                 {% endif %}
           - service: number.set_value
             target:
-              entity_id: !input charge_power_number            
+              entity_id: !input charge_power_number
+            data:
               value: 0
               
           - service: number.set_value
             target:
               entity_id: !input discharge_power_number
+            data:
               value: "{{ effective_discharge | int(0) }}"
               
           - service: select.select_option
@@ -454,11 +456,13 @@ action:
           - service: number.set_value
             target:
               entity_id: !input discharge_power_number
+            data:
               value: "{{ ramped_discharge | int(0) }}"
               
           - service: number.set_value
             target:
               entity_id: !input charge_power_number
+            data:
               value: "{{ charge_target_final | int(0) }}"
               
           - service: select.select_option
