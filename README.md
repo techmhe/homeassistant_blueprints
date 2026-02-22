@@ -5,6 +5,7 @@ Home Assistant Automation Blueprint zur automatischen Nulleinspeisung mit dem **
 ## Funktionen
 
 - **Automatische Nulleinspeisung** – Regelt Lade-/Entladeleistung so, dass kein (oder nur minimaler) Strom ins Netz eingespeist wird
+- **Automatische Force-Mode-Steuerung** – Setzt den Force Mode automatisch auf „laden" bei PV-Überschuss und „entladen" bei Netzbezug
 - **Manuelle Einspeisung** – Feste Entladeleistung manuell vorgeben (hat Vorrang vor Nulleinspeisung)
 - **Minimaler Netzbezug** – Einstellbar, wie viel Leistung immer aus dem Netz bezogen werden soll
 - **Maximale Netzeinspeisung** – Erlaubte Einspeiseleistung ins Netz konfigurierbar (0 W = echte Nulleinspeisung)
@@ -20,6 +21,7 @@ Home Assistant Automation Blueprint zur automatischen Nulleinspeisung mit dem **
 | **Marstek Venus A** | Batteriespeicher mit Modbus-Anbindung |
 | **Modbus-Integration** | [marstek_venus_modbus](https://github.com/ViperRNMC/marstek_venus_modbus) in Home Assistant installiert |
 | **Leistungsmesser** | z.B. Shelly Pro3 EM am Netzanschluss (Hausanschlusspunkt) |
+| **PV-Sensor** | Sensor für die aktuelle PV-Eingangsleistung (Solarleistung) |
 
 ### Benötigte Entitäten der Modbus-Integration
 
@@ -28,6 +30,7 @@ Home Assistant Automation Blueprint zur automatischen Nulleinspeisung mit dem **
 | Entladeleistung einstellen | `number.marstek_venus_modbus_entladeleistung_einstellen` |
 | Ladeleistung einstellen | `number.marstek_venus_modbus_ladeleistung_einstellen` |
 | Batterie-Ladezustand (SOC) | `sensor.marstek_venus_a_batterie_ladezustand` |
+| PV-Eingangsleistung | `sensor.marstek_venus_a_pv_eingangsleistung` |
 
 ### Netzleistungs-Sensor (Shelly Pro3 EM)
 
@@ -82,6 +85,7 @@ Vor dem Erstellen der Automatisierung müssen drei Helfer in Home Assistant ange
 | Parameter | Beschreibung | Standard |
 |---|---|---|
 | **Netzleistung Sensor** | Leistungssensor am Netzanschluss (z.B. Shelly Pro3 EM) | – |
+| **PV-Eingangsleistung Sensor** | Sensor für die aktuelle PV-Eingangsleistung (Solarleistung) | – |
 | **Batterie-Ladezustand** | SOC-Sensor des Marstek Venus A | – |
 | **Entladeleistung einstellen** | Number-Entity der Modbus-Integration | – |
 | **Ladeleistung einstellen** | Number-Entity der Modbus-Integration | – |
@@ -104,23 +108,30 @@ Vor dem Erstellen der Automatisierung müssen drei Helfer in Home Assistant ange
 Die Automatisierung läuft als proportionaler Regler mit Totzone:
 
 1. **Netzleistung messen** – Aktuellen Import/Export am Netzanschluss lesen
-2. **Soll-Leistung berechnen** – Lade-/Entladeleistung so anpassen, dass der Netzbezug auf den eingestellten minimalen Netzbezug geregelt wird
-3. **Grenzen anwenden** – SOC-Limits und Leistungsgrenzen einhalten
-4. **Lastspitzen filtern** – Beim Start der Entladung (aus dem Ruhezustand) wird die konfigurierte Verzögerung abgewartet
-5. **Rampe anwenden** – Entladeleistung wird schrittweise erhöht, nicht sprunghaft
-6. **Marstek steuern** – Neue Lade-/Entladeleistung per Modbus setzen
+2. **PV-Eingangsleistung lesen** – Aktuelle Solarleistung erfassen
+3. **Soll-Leistung berechnen** – Lade-/Entladeleistung so anpassen, dass der Netzbezug auf den eingestellten minimalen Netzbezug geregelt wird
+4. **Grenzen anwenden** – SOC-Limits und Leistungsgrenzen einhalten
+5. **Lastspitzen filtern** – Beim Start der Entladung (aus dem Ruhezustand) wird die konfigurierte Verzögerung abgewartet
+6. **Rampe anwenden** – Entladeleistung wird schrittweise erhöht, nicht sprunghaft
+7. **Force Mode setzen** – Automatisch „entladen" bei Netzbezug, „laden" bei PV-Überschuss, „halt" bei Inaktivität
+8. **Marstek steuern** – Neue Lade-/Entladeleistung per Modbus setzen
 
 ```
 Totzone = [Min. Netzbezug − Max. Einspeisung, Min. Netzbezug + 10 W]
 
 Wenn Netzimport oberhalb Totzone:
     → Entladeleistung erhöhen (schrittweise per Rampe)
+    → Force Mode = entladen
 
 Wenn Netzexport unterhalb Totzone:
     → Entladeleistung reduzieren oder Batterie laden (sofort)
+    → Force Mode = laden (nur wenn PV-Eingangsleistung > 0)
 
 Wenn innerhalb Totzone:
     → Keine Änderung (Oszillation vermeiden)
+
+Wenn weder Entladung noch Ladung aktiv:
+    → Force Mode = halt
 
 Beim Start der Entladung aus dem Ruhezustand:
     → Erst X Sekunden warten (Lastspitzen filtern)
@@ -149,6 +160,7 @@ Beim Start der Entladung aus dem Ruhezustand:
 ```yaml
 # Typische Konfiguration für Shelly Pro3 EM + Marstek Venus A
 Netzleistung Sensor:        sensor.shellyem3_total_power
+PV-Eingangsleistung Sensor: sensor.marstek_venus_a_pv_eingangsleistung
 Batterie-Ladezustand:       sensor.marstek_venus_a_batterie_ladezustand
 Entladeleistung einstellen:  number.marstek_venus_modbus_entladeleistung_einstellen
 Ladeleistung einstellen:     number.marstek_venus_modbus_ladeleistung_einstellen
