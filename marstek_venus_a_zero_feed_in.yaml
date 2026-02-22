@@ -332,6 +332,7 @@ action:
           - service: select.select_option
             target:
               entity_id: !input force_mode_select
+            data:
               option: >
                 {% if effective_discharge | int(0) > 0 %}
                   entladen
@@ -468,6 +469,7 @@ action:
           - service: select.select_option
             target:
               entity_id: !input force_mode_select
+            data:
               option: >
                 {% if ramped_discharge | int(0) > 0 %}
                   entladen
