@@ -6,9 +6,12 @@ Home Assistant Automation Blueprint zur automatischen Nulleinspeisung mit dem **
 
 - **Automatische Nulleinspeisung** – Regelt Lade-/Entladeleistung so, dass kein (oder nur minimaler) Strom ins Netz eingespeist wird
 - **Manuelle Einspeisung** – Feste Entladeleistung manuell vorgeben (hat Vorrang vor Nulleinspeisung)
+- **Minimaler Netzbezug** – Einstellbar, wie viel Leistung immer aus dem Netz bezogen werden soll
 - **Maximale Netzeinspeisung** – Erlaubte Einspeiseleistung ins Netz konfigurierbar (0 W = echte Nulleinspeisung)
 - **Maximale Lade-/Entladeleistung** – Leistungsgrenzen der Batterie einstellbar
 - **SOC-Schutz** – Minimaler und maximaler Ladezustand konfigurierbar
+- **Entladeverzögerung** – Kurze Lastspitzen werden gefiltert; Entladung startet erst nach konfigurierbarer Wartezeit
+- **Schrittweise Entladung** – Batterie rampt schrittweise hoch statt sofort mit voller Leistung zu entladen
 
 ## Voraussetzungen
 
@@ -38,14 +41,14 @@ Dies ist der Standard bei Shelly-Geräten.
 
 ### 1. Blueprint importieren
 
-[![Open your Home Assistant instance and show the blueprint import dialog with this blueprint pre-filled.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Ftechmhe%2Fhomeassistant_blueprints%2Fblob%2Fmain%2Fmarstek_venus_a_zero_feed_in.yaml)
+[![Open your Home Assistant instance and show the blueprint import dialog with this blueprint pre-filled.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fraw.githubusercontent.com%2Ftechmhe%2Fhomeassistant_blueprints%2Fmain%2Fmarstek_venus_a_zero_feed_in.yaml)
 
 Oder manuell:
 1. **Einstellungen** → **Automatisierungen & Szenen** → **Blueprints**
 2. **Blueprint importieren** klicken
 3. URL eingeben:
    ```
-   https://github.com/techmhe/homeassistant_blueprints/blob/main/marstek_venus_a_zero_feed_in.yaml
+   https://raw.githubusercontent.com/techmhe/homeassistant_blueprints/main/marstek_venus_a_zero_feed_in.yaml
    ```
 
 ### 2. Helfer erstellen
@@ -85,32 +88,43 @@ Vor dem Erstellen der Automatisierung müssen drei Helfer in Home Assistant ange
 | **Nulleinspeisung aktivieren** | Input Boolean Helfer | – |
 | **Manuelle Einspeisung aktivieren** | Input Boolean Helfer | – |
 | **Manuelle Entladeleistung** | Input Number Helfer (Watt) | – |
+| **Minimaler Netzbezug** | Mindest-Import aus dem Netz (W) | 0 W |
 | **Maximale Netzeinspeisung** | Erlaubter Export ins Netz (W) | 0 W |
 | **Maximale Entladeleistung** | Max. Batterie-Entladung (W) | 800 W |
 | **Maximale Ladeleistung** | Max. Batterie-Ladung (W) | 800 W |
 | **Minimaler SOC** | Untergrenze Ladezustand (%) | 10 % |
 | **Maximaler SOC** | Obergrenze Ladezustand (%) | 100 % |
+| **Entladeverzögerung** | Wartezeit vor Start der Entladung (s) | 3 s |
+| **Entlade-Schrittweite** | Max. Erhöhung pro Zyklus (W) | 200 W |
 
 ## Funktionsweise
 
 ### Regelungsalgorithmus
 
-Die Automatisierung läuft als proportionaler Regler:
+Die Automatisierung läuft als proportionaler Regler mit Totzone:
 
 1. **Netzleistung messen** – Aktuellen Import/Export am Netzanschluss lesen
-2. **Soll-Leistung berechnen** – Lade-/Entladeleistung so anpassen, dass der Netzbezug gegen 0 geht
+2. **Soll-Leistung berechnen** – Lade-/Entladeleistung so anpassen, dass der Netzbezug auf den eingestellten minimalen Netzbezug geregelt wird
 3. **Grenzen anwenden** – SOC-Limits und Leistungsgrenzen einhalten
-4. **Marstek steuern** – Neue Lade-/Entladeleistung per Modbus setzen
+4. **Lastspitzen filtern** – Beim Start der Entladung (aus dem Ruhezustand) wird die konfigurierte Verzögerung abgewartet
+5. **Rampe anwenden** – Entladeleistung wird schrittweise erhöht, nicht sprunghaft
+6. **Marstek steuern** – Neue Lade-/Entladeleistung per Modbus setzen
 
 ```
-Wenn Netzimport > 10 W:
-    → Entladeleistung erhöhen (Batterie speist mehr ein)
+Totzone = [Min. Netzbezug − Max. Einspeisung, Min. Netzbezug + 10 W]
 
-Wenn Netzexport > erlaubte Einspeisung:
-    → Entladeleistung reduzieren oder Batterie laden
+Wenn Netzimport oberhalb Totzone:
+    → Entladeleistung erhöhen (schrittweise per Rampe)
 
-Wenn im Toleranzbereich:
+Wenn Netzexport unterhalb Totzone:
+    → Entladeleistung reduzieren oder Batterie laden (sofort)
+
+Wenn innerhalb Totzone:
     → Keine Änderung (Oszillation vermeiden)
+
+Beim Start der Entladung aus dem Ruhezustand:
+    → Erst X Sekunden warten (Lastspitzen filtern)
+    → Dann schrittweise hochfahren (z.B. 0 → 200 → 400 → 600 W)
 ```
 
 ### Betriebsmodi
@@ -127,7 +141,8 @@ Wenn im Toleranzbereich:
 - **SOC-Schutz oben**: Batterie wird nicht geladen wenn SOC ≥ Maximaler SOC
 - **Leistungsbegrenzung**: Lade-/Entladeleistung wird auf die konfigurierten Maximalwerte begrenzt
 - **Sensorprüfung**: Automation pausiert bei nicht verfügbaren Sensoren
-- **Entprellung**: 3 Sekunden Verzögerung zur Vermeidung von Modbus-Überlastung
+- **Lastspitzenfilter**: Entladung startet erst nach konfigurierbarer Verzögerung (Standard: 3 s)
+- **Sanfter Anlauf**: Entladeleistung wird schrittweise erhöht (Standard: 200 W pro Zyklus), Reduzierung erfolgt sofort
 
 ## Beispielkonfiguration
 
@@ -140,11 +155,14 @@ Ladeleistung einstellen:     number.marstek_venus_modbus_ladeleistung_einstellen
 Nulleinspeisung aktivieren:  input_boolean.nulleinspeisung_aktiv
 Manuelle Einspeisung:        input_boolean.manuelle_einspeisung_aktiv
 Manuelle Entladeleistung:    input_number.manuelle_entladeleistung
+Minimaler Netzbezug:         50 W
 Maximale Netzeinspeisung:    0 W
 Maximale Entladeleistung:    800 W
 Maximale Ladeleistung:       800 W
 Minimaler SOC:               10 %
 Maximaler SOC:               100 %
+Entladeverzögerung:          3 s
+Entlade-Schrittweite:        200 W
 ```
 
 ## Dashboard-Steuerung (optional)

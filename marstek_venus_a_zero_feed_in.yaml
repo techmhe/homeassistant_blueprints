@@ -13,11 +13,17 @@ blueprint:
 
     - Manuelle Einspeisungssteuerung mit einstellbarer Leistung
 
-    - Einstellbare maximale Netzeinspeisung
+    - Einstellbarer minimaler Netzbezug
+
+    - Einstellbare maximale Netzeinspeisung (Export-Toleranz)
 
     - Einstellbare maximale Lade- und Entladeleistung
 
     - Einstellbarer minimaler und maximaler SOC
+
+    - Entladeverzögerung zur Unterdrückung kurzer Lastspitzen
+
+    - Schrittweise Entladung (Rampe) zum Schutz der Hardware
 
 
     Voraussetzungen:
@@ -108,12 +114,28 @@ blueprint:
           filter:
             domain: input_number
 
+    min_grid_import:
+      name: "Minimaler Netzbezug (W)"
+      description: >
+        Minimale Leistung in Watt, die immer aus dem Netz bezogen werden soll.
+        Bei 0 wird der Netzbezug auf nahezu Null geregelt.
+        Werte > 0 stellen sicher, dass mindestens dieser Wert importiert wird.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 1000
+          step: 10
+          unit_of_measurement: "W"
+          mode: slider
+
     max_grid_feed_in:
       name: "Maximale Netzeinspeisung (W)"
       description: >
         Maximale erlaubte Einspeisung ins Netz in Watt.
         Bei 0 wird keine Einspeisung erlaubt (echte Nulleinspeisung).
-        Werte > 0 erlauben eine begrenzte Einspeisung als Toleranz.
+        Werte > 0 erlauben eine begrenzte Einspeisung als Toleranz unterhalb
+        des minimalen Netzbezugs.
       default: 0
       selector:
         number:
@@ -175,7 +197,38 @@ blueprint:
           unit_of_measurement: "%"
           mode: slider
 
-mode: restart
+    discharge_delay:
+      name: "Entladeverzögerung (s)"
+      description: >
+        Wartezeit in Sekunden, bevor die Entladung aus dem Ruhezustand gestartet wird.
+        Filtert kurze Lastspitzen heraus. Die Entladung beginnt erst, wenn der
+        erhöhte Netzbezug für diese Dauer anhält.
+      default: 3
+      selector:
+        number:
+          min: 0
+          max: 30
+          step: 1
+          unit_of_measurement: "s"
+          mode: slider
+
+    discharge_step:
+      name: "Entlade-Schrittweite (W)"
+      description: >
+        Maximale Erhöhung der Entladeleistung pro Regelzyklus in Watt.
+        Verhindert, dass die Batterie sofort mit voller Leistung entlädt.
+        Beispiel: Bei 200 W steigt die Entladung schrittweise
+        (0 → 200 → 400 → 600 → 800 W).
+      default: 200
+      selector:
+        number:
+          min: 50
+          max: 2500
+          step: 50
+          unit_of_measurement: "W"
+          mode: slider
+
+mode: single
 max_exceeded: silent
 
 variables:
@@ -186,17 +239,20 @@ variables:
   zero_feed_in_entity: !input zero_feed_in_enabled
   manual_feed_in_entity: !input manual_feed_in_enabled
   manual_power_entity: !input manual_discharge_power
+  min_grid_import_value: !input min_grid_import
   max_feed_in_value: !input max_grid_feed_in
   max_discharge_value: !input max_discharge_power
   max_charge_value: !input max_charge_power
   min_soc_value: !input min_soc
   max_soc_value: !input max_soc
+  discharge_delay_value: !input discharge_delay
+  discharge_step_value: !input discharge_step
 
 trigger:
   - platform: state
     entity_id: !input grid_power_sensor
   - platform: time_pattern
-    minutes: "/1"
+    seconds: "/10"
 
 condition:
   - condition: or
@@ -213,9 +269,6 @@ condition:
          states(soc_entity) not in ['unknown', 'unavailable'] }}
 
 action:
-  - delay:
-      seconds: 3
-
   - choose:
       - conditions:
           - condition: state
@@ -226,7 +279,7 @@ action:
               manual_power: "{{ states(manual_power_entity) | float(0) }}"
               soc: "{{ states(soc_entity) | float(0) }}"
               effective_discharge: >
-                {% if soc <= min_soc_value %}
+                {% if soc <= min_soc_value | float(0) %}
                   {{ 0 }}
                 {% else %}
                   {{ [manual_power | float(0), max_discharge_value | float(0)] | min }}
@@ -253,15 +306,18 @@ action:
               current_discharge: "{{ states(discharge_entity) | float(0) }}"
               current_charge: "{{ states(charge_entity) | float(0) }}"
               current_net: "{{ current_discharge | float(0) - current_charge | float(0) }}"
-              import_tolerance: 10
+              target_import: "{{ min_grid_import_value | float(0) }}"
+              tolerance: 10
+              lower_bound: "{{ target_import | float(0) - max_feed_in_value | float(0) }}"
+              upper_bound: "{{ target_import | float(0) + tolerance }}"
               new_net: >
                 {% set g = grid | float(0) %}
                 {% set net = current_net | float(0) %}
-                {% set feed_in = max_feed_in_value | float(0) %}
-                {% if g > import_tolerance %}
-                  {{ net + g }}
-                {% elif g < (-feed_in) %}
-                  {{ net + g + feed_in }}
+                {% set target = target_import | float(0) %}
+                {% set lo = lower_bound | float(0) %}
+                {% set hi = upper_bound | float(0) %}
+                {% if g > hi or g < lo %}
+                  {{ net + g - target }}
                 {% else %}
                   {{ net }}
                 {% endif %}
@@ -269,10 +325,10 @@ action:
                 {% set net = new_net | float(0) %}
                 {% set s = soc | float(0) %}
                 {% if net > 0 %}
-                  {% if s <= min_soc_value | float(10) %}
+                  {% if s <= min_soc_value | float(0) %}
                     {{ 0 }}
                   {% else %}
-                    {{ [net, max_discharge_value | float(800)] | min }}
+                    {{ [net, max_discharge_value | float(0)] | min }}
                   {% endif %}
                 {% else %}
                   {{ 0 }}
@@ -281,19 +337,83 @@ action:
                 {% set net = new_net | float(0) %}
                 {% set s = soc | float(0) %}
                 {% if net < 0 %}
-                  {% if s >= max_soc_value | float(100) %}
+                  {% if s >= max_soc_value | float(0) %}
                     {{ 0 }}
                   {% else %}
-                    {{ [net | abs, max_charge_value | float(800)] | min }}
+                    {{ [net | abs, max_charge_value | float(0)] | min }}
                   {% endif %}
                 {% else %}
                   {{ 0 }}
                 {% endif %}
+              starting_discharge: >
+                {{ discharge_target | float(0) > 0 and
+                   current_discharge | float(0) == 0 and
+                   current_charge | float(0) == 0 }}
+
+          - if:
+              - condition: template
+                value_template: "{{ starting_discharge }}"
+            then:
+              - delay:
+                  seconds: "{{ discharge_delay_value | int(3) }}"
+              - variables:
+                  grid: "{{ states(grid_power_entity) | float(0) }}"
+                  soc: "{{ states(soc_entity) | float(0) }}"
+                  current_discharge: "{{ states(discharge_entity) | float(0) }}"
+                  current_charge: "{{ states(charge_entity) | float(0) }}"
+                  current_net: "{{ current_discharge | float(0) - current_charge | float(0) }}"
+                  new_net: >
+                    {% set g = grid | float(0) %}
+                    {% set net = current_net | float(0) %}
+                    {% set target = target_import | float(0) %}
+                    {% set lo = lower_bound | float(0) %}
+                    {% set hi = upper_bound | float(0) %}
+                    {% if g > hi or g < lo %}
+                      {{ net + g - target }}
+                    {% else %}
+                      {{ net }}
+                    {% endif %}
+                  discharge_target: >
+                    {% set net = new_net | float(0) %}
+                    {% set s = soc | float(0) %}
+                    {% if net > 0 %}
+                      {% if s <= min_soc_value | float(0) %}
+                        {{ 0 }}
+                      {% else %}
+                        {{ [net, max_discharge_value | float(0)] | min }}
+                      {% endif %}
+                    {% else %}
+                      {{ 0 }}
+                    {% endif %}
+                  charge_target: >
+                    {% set net = new_net | float(0) %}
+                    {% set s = soc | float(0) %}
+                    {% if net < 0 %}
+                      {% if s >= max_soc_value | float(0) %}
+                        {{ 0 }}
+                      {% else %}
+                        {{ [net | abs, max_charge_value | float(0)] | min }}
+                      {% endif %}
+                    {% else %}
+                      {{ 0 }}
+                    {% endif %}
+
+          - variables:
+              ramped_discharge: >
+                {% set target = discharge_target | float(0) %}
+                {% set current = states(discharge_entity) | float(0) %}
+                {% set step = discharge_step_value | float(200) %}
+                {% if target > current %}
+                  {{ [target, current + step] | min }}
+                {% else %}
+                  {{ target }}
+                {% endif %}
+
           - service: number.set_value
             target:
               entity_id: !input discharge_power_number
             data:
-              value: "{{ discharge_target | int(0) }}"
+              value: "{{ ramped_discharge | int(0) }}"
           - service: number.set_value
             target:
               entity_id: !input charge_power_number
