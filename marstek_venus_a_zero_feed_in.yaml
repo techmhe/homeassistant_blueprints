@@ -170,7 +170,7 @@ blueprint:
         number:
           min: 0
           max: 800
-          step: 50
+          step: 1
           unit_of_measurement: "W"
           mode: slider
 
@@ -182,7 +182,7 @@ blueprint:
         number:
           min: 0
           max: 1200
-          step: 50
+          step: 1
           unit_of_measurement: "W"
           mode: slider
 
@@ -239,9 +239,9 @@ blueprint:
       default: 200
       selector:
         number:
-          min: 50
+          min: 1
           max: 400
-          step: 50
+          step: 1
           unit_of_measurement: "W"
           mode: slider
 
@@ -285,6 +285,12 @@ trigger:
     entity_id: !input pv_power_sensor
   - platform: time_pattern
     seconds: "/10"
+  - platform: state
+    entity_id: !input zero_feed_in_enabled
+    to: "off"
+  - platform: state
+    entity_id: !input manual_feed_in_enabled
+    to: "off"
 
 condition:
   - condition: or
@@ -295,6 +301,11 @@ condition:
       - condition: state
         entity_id: !input manual_feed_in_enabled
         state: "on"
+      - condition: template
+        value_template: >
+          {{ trigger.entity_id is defined and
+             (trigger.entity_id == zero_feed_in_entity or
+              trigger.entity_id == manual_feed_in_entity) }}
   - condition: template
     value_template: >
       {{ states(grid_power_entity) not in ['unknown', 'unavailable'] and
@@ -327,14 +338,14 @@ action:
             target:
               entity_id: !input discharge_power_number
             data:
-              value: "{{ effective_discharge | int(0) }}"
+              value: "{{ effective_discharge | round(0) | int }}"
               
           - service: select.select_option
             target:
               entity_id: !input force_mode_select
             data:
               option: >
-                {% if effective_discharge | int(0) > 0 %}
+                {% if effective_discharge | round(0) | int > 0 %}
                   discharge
                 {% else %}
                   stop
@@ -458,23 +469,40 @@ action:
             target:
               entity_id: !input discharge_power_number
             data:
-              value: "{{ ramped_discharge | int(0) }}"
+              value: "{{ ramped_discharge | round(0) | int }}"
               
           - service: number.set_value
             target:
               entity_id: !input charge_power_number
             data:
-              value: "{{ charge_target_final | int(0) }}"
+              value: "{{ charge_target_final | round(0) | int }}"
               
           - service: select.select_option
             target:
               entity_id: !input force_mode_select
             data:
               option: >
-                {% if ramped_discharge | int(0) > 0 %}
+                {% if ramped_discharge | round(0) | int > 0 %}
                   discharge
-                {% elif charge_target_final | int(0) > 0 and states(pv_power_entity) | float(0) > 0 %}
+                {% elif charge_target_final | round(0) | int > 0 and states(pv_power_entity) | float(0) > 0 %}
                   charge
                 {% else %}
                   stop
                 {% endif %}
+
+    default:
+      - service: number.set_value
+        target:
+          entity_id: !input discharge_power_number
+        data:
+          value: 0
+      - service: number.set_value
+        target:
+          entity_id: !input charge_power_number
+        data:
+          value: 0
+      - service: select.select_option
+        target:
+          entity_id: !input force_mode_select
+        data:
+          option: "stop"
