@@ -249,7 +249,7 @@ blueprint:
       name: "Force Mode Auswahl"
       description: >
         Select-Entity für den Force Mode des Marstek Venus (Modbus).
-        Mögliche Werte: halt (Stopp), laden (Laden), entladen (Entladen).
+        Mögliche Werte: stop (Stopp), charge (Laden), discharge (Entladen).
         Standard-Entity: select.marstek_venus_modbus_force_mode
       selector:
         entity:
@@ -335,9 +335,9 @@ action:
             data:
               option: >
                 {% if effective_discharge | int(0) > 0 %}
-                  entladen
+                  discharge
                 {% else %}
-                  halt
+                  stop
                 {% endif %}
 
       - conditions:
@@ -472,9 +472,9 @@ action:
             data:
               option: >
                 {% if ramped_discharge | int(0) > 0 %}
-                  entladen
+                  discharge
                 {% elif charge_target_final | int(0) > 0 and states(pv_power_entity) | float(0) > 0 %}
-                  laden
+                  charge
                 {% else %}
-                  halt
+                  stop
                 {% endif %}
