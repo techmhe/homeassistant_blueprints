@@ -393,94 +393,81 @@ action:
                 {{ discharge_target | float(0) > 0 and
                    current_discharge | float(0) == 0 and
                    current_charge | float(0) == 0 }}
-
-      - if:
+          - if:
               - condition: template
                 value_template: "{{ starting_discharge }}"
             then:
               - delay:
                   seconds: "{{ discharge_delay_value | int(0) }}"
-
-          - variables:
-              # Hole die aktuellen Werte direkt vor der Berechnung
-              grid_current: "{{ states(grid_power_entity) | float(0) }}"
-              soc_current: "{{ states(soc_entity) | float(0) }}"
-              current_discharge_actual: "{{ states(discharge_entity) | float(0) }}"
-              current_charge_actual: "{{ states(charge_entity) | float(0) }}"
-              current_net_actual: "{{ current_discharge_actual | float(0) - current_charge_actual | float(0) }}"
-              
-              # Berechne new_net mit aktuellen Werten
-              new_net_final: >
-                {% set g = grid_current | float(0) %}
-                {% set net = current_net_actual | float(0) %}
-                {% set target = target_import | float(0) %}
-                {% set lo = lower_bound | float(0) %}
-                {% set hi = upper_bound | float(0) %}
-                {% if g > hi or g < lo %}
-                  {{ net + g - target }}
-                {% else %}
-                  {{ net }}
-                {% endif %}
-              
-              # Berechne discharge_target mit aktuellen Werten
-              discharge_target_final: >
-                {% set net = new_net_final | float(0) %}
-                {% set s = soc_current | float(0) %}
-                {% if net > 0 %}
-                  {% if s <= min_soc_value | float(0) %}
-                    {{ 0 }}
-                  {% else %}
-                    {{ [net, max_discharge_value | float(0)] | min }}
-                  {% endif %}
-                {% else %}
-                  {{ 0 }}
-                {% endif %}
-              
-              # Berechne charge_target mit aktuellen Werten
-              charge_target_final: >
-                {% set net = new_net_final | float(0) %}
-                {% set s = soc_current | float(0) %}
-                {% if net < 0 %}
-                  {% if s >= max_soc_value | float(0) %}
-                    {{ 0 }}
-                  {% else %}
-                    {{ [net | abs, max_charge_value | float(0)] | min }}
-                  {% endif %}
-                {% else %}
-                  {{ 0 }}
-                {% endif %}
-              
-              # Berechne ramped_discharge mit aktuellen Werten
-              ramped_discharge: >
-                {% set target = discharge_target_final | float(0) %}
-                {% set current = current_discharge_actual | float(0) %}
-                {% set step = discharge_step_value | float(0) %}
-                {% if target > current %}
-                  {{ [target, current + step] | min }}
-                {% else %}
-                  {{ target }}
-                {% endif %}
-
-          - service: number.set_value
-            target:
-              entity_id: !input discharge_power_number
-            
-              value: "{{ ramped_discharge | int(0) }}"
-          - service: number.set_value
-            target:
-              entity_id: !input charge_power_number
-            
-              value: "{{ charge_target_final | int(0) }}"
-          - service: select.select_option
-            target:
-              entity_id: !input force_mode_select
-            
-              option: >
-                {% if ramped_discharge | int(0) > 0 %}
-                  entladen
-                {% elif charge_target_final | int(0) > 0 and states(pv_power_entity) | float(0) > 0 %}
-                  laden
-                {% else %}
-                  halt
-                {% endif %}
-
+              - variables:
+                  grid_current: "{{ states(grid_power_entity) | float(0) }}"
+                  soc_current: "{{ states(soc_entity) | float(0) }}"
+                  current_discharge_actual: "{{ states(discharge_entity) | float(0) }}"
+                  current_charge_actual: "{{ states(charge_entity) | float(0) }}"
+                  current_net_actual: "{{ current_discharge_actual | float(0) - current_charge_actual | float(0) }}"
+                  new_net_final: >
+                    {% set g = grid_current | float(0) %}
+                    {% set net = current_net_actual | float(0) %}
+                    {% set target = target_import | float(0) %}
+                    {% set lo = lower_bound | float(0) %}
+                    {% set hi = upper_bound | float(0) %}
+                    {% if g > hi or g < lo %}
+                      {{ net + g - target }}
+                    {% else %}
+                      {{ net }}
+                    {% endif %}
+                  discharge_target_final: >
+                    {% set net = new_net_final | float(0) %}
+                    {% set s = soc_current | float(0) %}
+                    {% if net > 0 %}
+                      {% if s <= min_soc_value | float(0) %}
+                        {{ 0 }}
+                      {% else %}
+                        {{ [net, max_discharge_value | float(0)] | min }}
+                      {% endif %}
+                    {% else %}
+                      {{ 0 }}
+                    {% endif %}
+                  charge_target_final: >
+                    {% set net = new_net_final | float(0) %}
+                    {% set s = soc_current | float(0) %}
+                    {% if net < 0 %}
+                      {% if s >= max_soc_value | float(0) %}
+                        {{ 0 }}
+                      {% else %}
+                        {{ [net | abs, max_charge_value | float(0)] | min }}
+                      {% endif %}
+                    {% else %}
+                      {{ 0 }}
+                    {% endif %}
+                  ramped_discharge: >
+                    {% set target = discharge_target_final | float(0) %}
+                    {% set current = current_discharge_actual | float(0) %}
+                    {% set step = discharge_step_value | float(0) %}
+                    {% if target > current %}
+                      {{ [target, current + step] | min }}
+                    {% else %}
+                      {{ target }}
+                    {% endif %}
+              - service: number.set_value
+                target:
+                  entity_id: !input discharge_power_number
+                data:
+                  value: "{{ ramped_discharge | int(0) }}"
+              - service: number.set_value
+                target:
+                  entity_id: !input charge_power_number
+                data:
+                  value: "{{ charge_target_final | int(0) }}"
+              - service: select.select_option
+                target:
+                  entity_id: !input force_mode_select
+                data:
+                  option: >
+                    {% if ramped_discharge | int(0) > 0 %}
+                      entladen
+                    {% elif charge_target_final | int(0) > 0 and states(pv_power_entity) | float(0) > 0 %}
+                      laden
+                    {% else %}
+                      halt
+                    {% endif %}
