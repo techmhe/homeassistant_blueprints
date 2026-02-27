@@ -845,6 +845,151 @@ class TestMultiCycleSimulation:
         assert r["force_mode"] == "charge"
 
 
+class TestDelayAndReRead:
+    """Test that post-delay re-read uses fresh sensor values.
+
+    The blueprint reads sensors before and after the discharge delay.
+    If the grid situation normalises during the delay, the final targets
+    should reflect the new state, not the pre-delay state.
+    """
+
+    def run_with_different_post_delay_values(
+        self,
+        pre_grid: float,
+        post_grid: float,
+        soc: float,
+        config: dict | None = None,
+    ) -> dict:
+        """
+        Simulate a cycle where pre-delay and post-delay readings differ.
+        The pre-delay values trigger starting_discharge; post-delay values
+        may cause the controller to re-evaluate.
+        """
+        entities_pre = {
+            "sensor.grid_power": pre_grid,
+            "sensor.pv_power": 0,
+            "sensor.soc": soc,
+            "number.discharge": 0,
+            "number.charge": 0,
+        }
+        ctx = build_context(entities_pre, config)
+
+        # Pre-delay: read current state (same as run_zero_feed_in step 1)
+        grid_val = float(render_template("{{ states(grid_power_entity) | float(0) }}", ctx))
+        pv_val = float(render_template(TPL_PV_POWER, ctx))
+        soc_val = float(render_template("{{ states(soc_entity) | float(0) }}", ctx))
+        cur_d = float(render_template(TPL_CURRENT_DISCHARGE, ctx))
+        cur_c = float(render_template(TPL_CURRENT_CHARGE, ctx))
+
+        ctx["grid"] = grid_val
+        ctx["pv_power"] = pv_val
+        ctx["soc"] = soc_val
+        ctx["current_discharge"] = cur_d
+        ctx["current_charge"] = cur_c
+
+        current_net = float(render_template(TPL_CURRENT_NET, ctx))
+        ctx["current_net"] = current_net
+
+        target_import = float(ctx["min_grid_import_value"])
+        ctx["target_import"] = target_import
+        ctx["tolerance"] = 10
+        lower_bound = target_import - 10
+        upper_bound = target_import + 10
+        ctx["lower_bound"] = lower_bound
+        ctx["upper_bound"] = upper_bound
+
+        new_net = float(render_template(TPL_NEW_NET, ctx))
+        ctx["new_net"] = new_net
+
+        discharge_target = float(render_template(TPL_DISCHARGE_TARGET, ctx))
+        ctx["discharge_target"] = discharge_target
+        charge_target = float(render_template(TPL_CHARGE_TARGET, ctx))
+        ctx["charge_target"] = charge_target
+
+        starting_discharge_str = render_template(TPL_STARTING_DISCHARGE, ctx)
+        starting_discharge = starting_discharge_str.strip().lower() == "true"
+
+        # Simulate post-delay re-read with DIFFERENT grid value
+        ctx["grid_current"] = post_grid
+        ctx["soc_current"] = soc_val
+        ctx["pv_current"] = pv_val
+        ctx["current_discharge_actual"] = cur_d
+        ctx["current_charge_actual"] = cur_c
+
+        current_net_actual = float(render_template(TPL_CURRENT_NET, ctx))
+        ctx["current_net_actual"] = current_net_actual
+
+        # Recalculate new_net with post-delay grid
+        ctx["grid"] = post_grid
+        new_net_final = float(render_template(TPL_NEW_NET, ctx))
+        ctx["new_net_final"] = new_net_final
+
+        # Recalculate targets with fresh values
+        ctx["new_net"] = new_net_final
+        discharge_target_final = float(render_template(TPL_DISCHARGE_TARGET, ctx))
+        ctx["discharge_target_final"] = discharge_target_final
+        charge_target_final = float(render_template(TPL_CHARGE_TARGET, ctx))
+        ctx["charge_target_final"] = charge_target_final
+
+        ramped_discharge = float(render_template(TPL_RAMPED_DISCHARGE, ctx))
+        ctx["ramped_discharge"] = ramped_discharge
+
+        force_mode = render_template(TPL_FORCE_MODE, ctx)
+
+        return {
+            "starting_discharge": starting_discharge,
+            "pre_discharge_target": discharge_target,
+            "new_net_final": new_net_final,
+            "discharge_target_final": discharge_target_final,
+            "ramped_discharge": ramped_discharge,
+            "force_mode": force_mode,
+        }
+
+    def test_grid_normalises_during_delay(self):
+        """
+        Pre-delay: grid=400W → starting_discharge=True, delay triggered.
+        Post-delay: grid=5W (within dead band) → no discharge needed.
+        Final output should be 0W / stop, not the pre-delay target.
+        """
+        result = self.run_with_different_post_delay_values(
+            pre_grid=400, post_grid=5, soc=80
+        )
+        assert result["starting_discharge"] is True  # delay was triggered
+        # After re-read: grid=5 is within [-10, 10] → new_net_final stays at 0
+        assert result["new_net_final"] == 0.0
+        assert result["discharge_target_final"] == 0.0
+        assert result["ramped_discharge"] == 0.0
+        assert result["force_mode"] == "stop"
+
+    def test_grid_still_high_after_delay(self):
+        """
+        Pre-delay and post-delay grid both high → discharge starts normally.
+        """
+        result = self.run_with_different_post_delay_values(
+            pre_grid=400, post_grid=350, soc=80
+        )
+        assert result["starting_discharge"] is True
+        assert result["discharge_target_final"] == 350.0
+        assert result["ramped_discharge"] == 200.0  # ramped from 0
+        assert result["force_mode"] == "discharge"
+
+    def test_grid_partially_resolved_during_delay(self):
+        """
+        Pre-delay: grid=400W.
+        Post-delay: grid=50W (above dead band but reduced).
+        Final discharge should be based on the post-delay value.
+        """
+        result = self.run_with_different_post_delay_values(
+            pre_grid=400, post_grid=50, soc=80
+        )
+        assert result["starting_discharge"] is True
+        # post_delay grid=50 > upper_bound=10 → adjust: new_net = 0 + 50 - 0 = 50
+        assert result["new_net_final"] == 50.0
+        assert result["discharge_target_final"] == 50.0
+        assert result["ramped_discharge"] == 50.0  # min(50, 0+200)=50
+        assert result["force_mode"] == "discharge"
+
+
 class TestEdgeCases:
     """Test edge cases and boundary conditions."""
 

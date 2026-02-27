@@ -177,10 +177,12 @@ blueprint:
     max_grid_feed_in:
       name: "Maximale Netzeinspeisung (W)"
       description: >
-        Maximale erlaubte Einspeisung ins Netz in Watt.
-        Bei 0 wird keine Einspeisung erlaubt (echte Nulleinspeisung).
-        Werte > 0 erlauben eine begrenzte Einspeisung als Toleranz unterhalb
-        des minimalen Netzbezugs.
+        Hinweis: Dieser Parameter ist aktuell NICHT in der Regellogik aktiv.
+        Das Totband ist fest auf ±10 W um den Ziel-Netzbezug (min_grid_import) gesetzt.
+        Eine asymmetrische Erweiterung des Totbands nach unten führte in früheren
+        Versionen dazu, dass die Batterie bei hoher Einspeisung stecken blieb
+        (z.B. Totband [-800, +10] bei max_feed_in=800 → keine Abreglung bei -200 W).
+        Das Feld ist für eine spätere korrekte Implementierung reserviert.
       default: 0
       selector:
         number:
