@@ -42,6 +42,7 @@ def make_states(entity_values: dict):
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG = dict(
     min_grid_import_value=0,
+    dead_band_value=10,
     max_discharge_value=800,
     max_charge_value=800,
     min_soc_value=10,
@@ -216,7 +217,7 @@ def run_zero_feed_in(
 
     target_import = float(ctx["min_grid_import_value"])
     ctx["target_import"] = target_import
-    tolerance = 10
+    tolerance = float(ctx["dead_band_value"])
     ctx["tolerance"] = tolerance
     lower_bound = target_import - tolerance
     upper_bound = target_import + tolerance
@@ -587,6 +588,17 @@ class TestDeadBand:
         assert result["new_net"] == 170.0
         assert result["discharge_target"] == 170.0
 
+    def test_custom_dead_band(self):
+        """Custom dead band of 30W → dead band [-30, 30]; grid=20 is within → no change."""
+        result = run_zero_feed_in(
+            grid=20, pv=0, soc=80,
+            discharge_setting=300, charge_setting=0,
+            config={"dead_band_value": 30}
+        )
+        assert result["lower_bound"] == -30.0
+        assert result["upper_bound"] == 30.0
+        assert result["new_net"] == 300.0  # unchanged, grid within band
+
 
 class TestPowerLimits:
     """Test max discharge and charge power limits."""
@@ -921,9 +933,10 @@ class TestDelayAndReRead:
 
         target_import = float(ctx["min_grid_import_value"])
         ctx["target_import"] = target_import
-        ctx["tolerance"] = 10
-        lower_bound = target_import - 10
-        upper_bound = target_import + 10
+        tolerance = float(ctx["dead_band_value"])
+        ctx["tolerance"] = tolerance
+        lower_bound = target_import - tolerance
+        upper_bound = target_import + tolerance
         ctx["lower_bound"] = lower_bound
         ctx["upper_bound"] = upper_bound
 
