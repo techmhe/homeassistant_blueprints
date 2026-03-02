@@ -42,7 +42,6 @@ def make_states(entity_values: dict):
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG = dict(
     min_grid_import_value=0,
-    max_feed_in_value=0,
     max_discharge_value=800,
     max_charge_value=800,
     min_soc_value=10,
@@ -445,6 +444,23 @@ class TestSOCProtection:
         assert result["charge_target"] == 300.0
         assert result["force_mode"] == "charge"
 
+    def test_full_soc_no_load_pv_producing_does_not_discharge(self):
+        """SOC=100%, no load, PV producing → stop, no discharge into grid.
+
+        With PV=500W and no load, grid reads -500W (exporting).
+        The controller wants to charge (new_net=-500) but SOC is full → blocked.
+        Discharge target must stay 0; battery must not export solar to grid.
+        """
+        result = run_zero_feed_in(
+            grid=-500, pv=500, soc=100,
+            discharge_setting=0, charge_setting=0
+        )
+        assert result["new_net"] == -500.0      # controller wants to charge
+        assert result["charge_target"] == 0.0   # blocked by max SOC
+        assert result["discharge_target"] == 0.0  # no discharge triggered
+        assert result["ramped_discharge"] == 0.0
+        assert result["force_mode"] == "stop"
+
 
 class TestRampUp:
     """Test discharge ramp-up logic."""
@@ -557,6 +573,19 @@ class TestDeadBand:
         )
         # 70 > 60 → new_net = 200 + 70 - 50 = 220
         assert result["new_net"] == 220.0
+
+    def test_custom_target_below_band(self):
+        """Custom target=50, grid=20, dead band [40, 60] → reduce discharge."""
+        result = run_zero_feed_in(
+            grid=20, pv=0, soc=80,
+            discharge_setting=200, charge_setting=0,
+            config={"min_grid_import_value": 50}
+        )
+        # 20 < 40 → new_net = 200 + 20 - 50 = 170
+        assert result["lower_bound"] == 40.0
+        assert result["upper_bound"] == 60.0
+        assert result["new_net"] == 170.0
+        assert result["discharge_target"] == 170.0
 
 
 class TestPowerLimits:
@@ -1052,18 +1081,18 @@ class TestEdgeCases:
         assert result["pv_power"] == -10.0
         assert result["force_mode"] == "discharge"  # discharge, not charge
 
-    def test_large_max_feed_in_does_not_prevent_discharge_reduction(self):
-        """Regression: large max_feed_in should not prevent discharge reduction.
+    def test_large_grid_export_does_not_prevent_discharge_reduction(self):
+        """Regression: large grid export should not prevent discharge reduction.
 
         Previously, max_feed_in_value was used for the dead band lower bound,
         causing the dead band to become [-800, 10] when max_feed_in=800. This
         meant the controller never reduced discharge when exporting to grid.
+        The dead band is now always ±10 W (symmetric).
         """
         # Scenario from issue: discharging 570W, grid at -204W (exporting)
         result = run_zero_feed_in(
             grid=-204.3, pv=0, soc=41,
             discharge_setting=570, charge_setting=0,
-            config={"max_feed_in_value": 800}
         )
         # Grid at -204.3 is outside dead band [-10, 10] → must adjust
         # new_net = 570 + (-204.3) - 0 = 365.7
@@ -1082,7 +1111,6 @@ class TestEdgeCases:
         result = run_zero_feed_in(
             grid=-600, pv=0, soc=80,
             discharge_setting=800, charge_setting=0,
-            config={"max_feed_in_value": 800}
         )
         # Grid at -600 is outside [-10, 10] → adjust
         # new_net = 800 + (-600) - 0 = 200

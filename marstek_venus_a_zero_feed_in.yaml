@@ -174,24 +174,6 @@ blueprint:
           unit_of_measurement: "W"
           mode: slider
 
-    max_grid_feed_in:
-      name: "Maximale Netzeinspeisung (W)"
-      description: >
-        Hinweis: Dieser Parameter ist aktuell NICHT in der Regellogik aktiv.
-        Das Totband ist fest auf ±10 W um den Ziel-Netzbezug (min_grid_import) gesetzt.
-        Eine asymmetrische Erweiterung des Totbands nach unten führte in früheren
-        Versionen dazu, dass die Batterie bei hoher Einspeisung stecken blieb
-        (z.B. Totband [-800, +10] bei max_feed_in=800 → keine Abreglung bei -200 W).
-        Das Feld ist für eine spätere korrekte Implementierung reserviert.
-      default: 0
-      selector:
-        number:
-          min: 0
-          max: 800
-          step: 5
-          unit_of_measurement: "W"
-          mode: slider
-
     max_discharge_power:
       name: "Maximale Entladeleistung (W)"
       description: "Maximale Entladeleistung der Batterie in Watt."
@@ -308,7 +290,6 @@ variables:
   force_mode_entity: !input force_mode_select
   # Numeric configuration values
   min_grid_import_value: !input min_grid_import
-  max_feed_in_value: !input max_grid_feed_in
   max_discharge_value: !input max_discharge_power
   max_charge_value: !input max_charge_power
   min_soc_value: !input min_soc
@@ -435,7 +416,7 @@ action:
           # Set the force mode (discharge or stop)
           - service: select.select_option
             target:
-              entity_id: !input force_mode_select
+              entity_id: "{{ force_mode_entity }}"
             data:
               option: "{{ force_mode_option }}"
 
@@ -695,7 +676,7 @@ action:
           # Set the force mode last – the power values are already set correctly
           - service: select.select_option
             target:
-              entity_id: !input force_mode_select
+              entity_id: "{{ force_mode_entity }}"
             data:
               option: "{{ force_mode_option }}"
 
@@ -722,6 +703,6 @@ action:
           value: 0
       - service: select.select_option
         target:
-          entity_id: !input force_mode_select
+          entity_id: "{{ force_mode_entity }}"
         data:
           option: "stop"
