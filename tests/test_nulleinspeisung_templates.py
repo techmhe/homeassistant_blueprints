@@ -47,6 +47,7 @@ DEFAULT_CONFIG = dict(
     max_charge_value=800,
     min_soc_value=10,
     max_soc_value=100,
+    recovery_soc_value=0,
     discharge_delay_value=3,
     discharge_step_value=200,
 )
@@ -119,15 +120,21 @@ TPL_DISCHARGE_TARGET = """
 """
 
 TPL_CHARGE_TARGET = """
-{%- set net = new_net | float(0) -%}
-{%- if net < 0 -%}
-  {%- if soc | float(0) >= max_soc_value | float(0) -%}
-    {{ 0 }}
-  {%- else -%}
-    {{ [net | abs, max_charge_value | float(0)] | min }}
-  {%- endif -%}
+{%- set rec = recovery_soc_value | float(0) -%}
+{%- set s = soc | float(0) -%}
+{%- if rec > 0 and s <= rec -%}
+  {{ max_charge_value | float(0) }}
 {%- else -%}
-  {{ 0 }}
+  {%- set net = new_net | float(0) -%}
+  {%- if net < 0 -%}
+    {%- if s >= max_soc_value | float(0) -%}
+      {{ 0 }}
+    {%- else -%}
+      {{ [net | abs, max_charge_value | float(0)] | min }}
+    {%- endif -%}
+  {%- else -%}
+    {{ 0 }}
+  {%- endif -%}
 {%- endif -%}
 """
 
@@ -149,9 +156,11 @@ TPL_RAMPED_DISCHARGE = """
 """
 
 TPL_FORCE_MODE = """
+{%- set rec = recovery_soc_value | float(0) -%}
+{%- set recovery_active = rec > 0 and soc_current | float(0) <= rec -%}
 {%- if ramped_discharge | float(0) > 0 -%}
   discharge
-{%- elif charge_target_final | float(0) > 0 and pv_current | float(0) > 0 -%}
+{%- elif charge_target_final | float(0) > 0 and (pv_current | float(0) > 0 or recovery_active) -%}
   charge
 {%- else -%}
   stop
@@ -461,6 +470,52 @@ class TestSOCProtection:
         assert result["discharge_target"] == 0.0  # no discharge triggered
         assert result["ramped_discharge"] == 0.0
         assert result["force_mode"] == "stop"
+
+    def test_below_min_soc_no_pv_stays_stopped(self):
+        """SOC below min (18% < 20%), grid importing, no PV → stop, no recovery.
+
+        The controller wants to discharge (new_net > 0) but SOC protection
+        blocks it. charge_target stays 0 because new_net >= 0. Battery is idle.
+        """
+        result = run_zero_feed_in(
+            grid=300, pv=0, soc=18,
+            discharge_setting=0, charge_setting=0,
+            config={"min_soc_value": 20}
+        )
+        assert result["discharge_target"] == 0.0
+        assert result["charge_target"] == 0.0
+        assert result["ramped_discharge"] == 0.0
+        assert result["force_mode"] == "stop"
+
+    def test_below_min_soc_with_pv_surplus_charges(self):
+        """SOC below min (18% < 20%), grid exporting, PV active → charge.
+
+        min_soc only blocks discharge. When PV causes grid export (new_net < 0),
+        charging is allowed and will incidentally bring SOC back above min_soc.
+        """
+        result = run_zero_feed_in(
+            grid=-300, pv=500, soc=18,
+            discharge_setting=0, charge_setting=0,
+            config={"min_soc_value": 20}
+        )
+        assert result["discharge_target"] == 0.0
+        assert result["charge_target"] == 300.0
+        assert result["force_mode"] == "charge"
+
+    def test_above_min_soc_after_recovery_allows_discharge(self):
+        """SOC just above min (21% > 20%), grid importing → discharge resumes.
+
+        Once SOC crosses back above min_soc the protection lifts immediately
+        on the next cycle.
+        """
+        result = run_zero_feed_in(
+            grid=300, pv=0, soc=21,
+            discharge_setting=0, charge_setting=0,
+            config={"min_soc_value": 20}
+        )
+        assert result["discharge_target"] == 300.0
+        assert result["ramped_discharge"] > 0
+        assert result["force_mode"] == "discharge"
 
 
 class TestRampUp:
@@ -1132,6 +1187,96 @@ class TestEdgeCases:
         # Ramp-down is immediate
         assert result["ramped_discharge"] == 200.0
         assert result["force_mode"] == "discharge"
+
+
+class TestSOCRecovery:
+    """Test SOC recovery charging feature.
+
+    When SOC <= recovery_soc (and recovery_soc > 0), the controller forces
+    charging at max_charge_power — even from the grid — until SOC reaches
+    min_soc. This prevents the battery from staying critically depleted.
+    """
+
+    # Common config: min_soc=20%, recovery_soc=10%
+    RECOVERY_CFG = {"min_soc_value": 20, "recovery_soc_value": 10}
+
+    def test_recovery_triggers_below_threshold(self):
+        """SOC=9% <= recovery_soc=10% → forced charge at max_charge_power."""
+        result = run_zero_feed_in(
+            grid=0, pv=0, soc=9,
+            discharge_setting=0, charge_setting=0,
+            config=self.RECOVERY_CFG,
+        )
+        assert result["charge_target"] == 800.0  # max_charge_value default
+        assert result["force_mode"] == "charge"
+
+    def test_recovery_allows_grid_charging(self):
+        """Recovery active with pv=0 → force_mode=charge (no PV required)."""
+        result = run_zero_feed_in(
+            grid=0, pv=0, soc=9,
+            discharge_setting=0, charge_setting=0,
+            config=self.RECOVERY_CFG,
+        )
+        # PV is 0, but recovery bypasses PV requirement
+        assert result["pv_power"] == 0.0
+        assert result["force_mode"] == "charge"
+
+    def test_recovery_charges_at_max_power(self):
+        """Recovery charge power equals max_charge_power (800 W default)."""
+        result = run_zero_feed_in(
+            grid=0, pv=0, soc=5,
+            discharge_setting=0, charge_setting=0,
+            config=self.RECOVERY_CFG,
+        )
+        assert result["charge_target"] == 800.0
+
+    def test_recovery_ends_at_min_soc(self):
+        """SOC=20% == min_soc=20%, recovery_soc=10% → recovery NOT active."""
+        result = run_zero_feed_in(
+            grid=0, pv=0, soc=20,
+            discharge_setting=0, charge_setting=0,
+            config=self.RECOVERY_CFG,
+        )
+        # soc=20 > recovery_soc=10 → recovery inactive, normal logic
+        # grid=0 within dead band → no charge or discharge
+        assert result["charge_target"] == 0.0
+        assert result["force_mode"] == "stop"
+
+    def test_recovery_inactive_above_threshold(self):
+        """SOC=11% > recovery_soc=10% → normal zero-feed-in logic, no forced charge."""
+        result = run_zero_feed_in(
+            grid=0, pv=0, soc=11,
+            discharge_setting=0, charge_setting=0,
+            config=self.RECOVERY_CFG,
+        )
+        # Recovery not active; grid=0 within dead band → no adjustment
+        assert result["charge_target"] == 0.0
+        assert result["force_mode"] == "stop"
+
+    def test_recovery_disabled_at_zero(self):
+        """recovery_soc=0 → feature disabled, even at critically low SOC."""
+        result = run_zero_feed_in(
+            grid=0, pv=0, soc=5,
+            discharge_setting=0, charge_setting=0,
+            config={"min_soc_value": 20, "recovery_soc_value": 0},
+        )
+        # recovery_soc=0 → rec > 0 is False → no forced charge
+        assert result["charge_target"] == 0.0
+        assert result["force_mode"] == "stop"
+
+    def test_recovery_no_discharge_during_recovery(self):
+        """Recovery active: grid importing 500W, but SOC too low → no discharge."""
+        result = run_zero_feed_in(
+            grid=500, pv=0, soc=9,
+            discharge_setting=0, charge_setting=0,
+            config=self.RECOVERY_CFG,
+        )
+        # soc=9 <= min_soc=20 → discharge blocked
+        assert result["discharge_target"] == 0.0
+        assert result["ramped_discharge"] == 0.0
+        # Recovery forces charge instead
+        assert result["charge_target"] == 800.0
+        assert result["force_mode"] == "charge"
 
 
 if __name__ == "__main__":

@@ -242,6 +242,21 @@ blueprint:
           unit_of_measurement: "%"
           mode: slider
 
+    recovery_soc:
+      name: "Recovery SOC (%)"
+      description: >
+        Wenn der Batterie-Ladezustand auf oder unter diesen Wert fällt, erzwingt
+        der Regler das Laden mit max_charge_power – auch aus dem Netz – bis der
+        SOC wieder min_soc erreicht. Auf 0 setzen zum Deaktivieren (Standard).
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: slider
+
     discharge_delay:
       name: "Entladeverzögerung (s)"
       description: >
@@ -311,6 +326,7 @@ variables:
   max_charge_value: !input max_charge_power
   min_soc_value: !input min_soc
   max_soc_value: !input max_soc
+  recovery_soc_value: !input recovery_soc
   discharge_delay_value: !input discharge_delay
   discharge_step_value: !input discharge_step
 
@@ -519,17 +535,25 @@ action:
                   {{ 0 }}
                 {%- endif -%}
               # Charge target: how much to charge (W), 0 if net >= 0
-              # Respects SOC maximum and max charge power limits
+              # Respects SOC maximum and max charge power limits.
+              # Recovery branch: if SOC <= recovery_soc, force-charge at max power
+              # (even from grid), until SOC reaches min_soc.
               charge_target: >
-                {%- set net = new_net | float(0) -%}
-                {%- if net < 0 -%}
-                  {%- if soc | float(0) >= max_soc_value | float(0) -%}
-                    {{ 0 }}
-                  {%- else -%}
-                    {{ [net | abs, max_charge_value | float(0)] | min }}
-                  {%- endif -%}
+                {%- set rec = recovery_soc_value | float(0) -%}
+                {%- set s = soc | float(0) -%}
+                {%- if rec > 0 and s <= rec -%}
+                  {{ max_charge_value | float(0) }}
                 {%- else -%}
-                  {{ 0 }}
+                  {%- set net = new_net | float(0) -%}
+                  {%- if net < 0 -%}
+                    {%- if s >= max_soc_value | float(0) -%}
+                      {{ 0 }}
+                    {%- else -%}
+                      {{ [net | abs, max_charge_value | float(0)] | min }}
+                    {%- endif -%}
+                  {%- else -%}
+                    {{ 0 }}
+                  {%- endif -%}
                 {%- endif -%}
               # Detect if we are starting a discharge from a completely idle state.
               # If so, we will apply the discharge delay to filter short load spikes.
@@ -603,15 +627,21 @@ action:
                 {%- endif -%}
               # Final charge target with fresh SOC
               charge_target_final: >
-                {%- set net = new_net_final | float(0) -%}
-                {%- if net < 0 -%}
-                  {%- if soc_current | float(0) >= max_soc_value | float(0) -%}
-                    {{ 0 }}
-                  {%- else -%}
-                    {{ [net | abs, max_charge_value | float(0)] | min }}
-                  {%- endif -%}
+                {%- set rec = recovery_soc_value | float(0) -%}
+                {%- set s = soc_current | float(0) -%}
+                {%- if rec > 0 and s <= rec -%}
+                  {{ max_charge_value | float(0) }}
                 {%- else -%}
-                  {{ 0 }}
+                  {%- set net = new_net_final | float(0) -%}
+                  {%- if net < 0 -%}
+                    {%- if s >= max_soc_value | float(0) -%}
+                      {{ 0 }}
+                    {%- else -%}
+                      {{ [net | abs, max_charge_value | float(0)] | min }}
+                    {%- endif -%}
+                  {%- else -%}
+                    {{ 0 }}
+                  {%- endif -%}
                 {%- endif -%}
               # Apply ramp-up to discharge: limit increase per cycle by discharge_step.
               # Ramp-down is immediate (no step limit when reducing discharge).
@@ -626,13 +656,15 @@ action:
                 {%- endif -%}
               # Determine force mode:
               # - "discharge" if we have a positive discharge target
-              # - "charge" if we have a positive charge target AND PV is producing
-              #   (we only charge when PV is available to avoid charging from grid)
+              # - "charge" if we have a positive charge target AND (PV is producing
+              #   OR recovery is active — recovery allows charging from grid)
               # - "stop" otherwise (idle)
               force_mode_option: >
+                {%- set rec = recovery_soc_value | float(0) -%}
+                {%- set recovery_active = rec > 0 and soc_current | float(0) <= rec -%}
                 {%- if ramped_discharge | float(0) > 0 -%}
                   discharge
-                {%- elif charge_target_final | float(0) > 0 and pv_current | float(0) > 0 -%}
+                {%- elif charge_target_final | float(0) > 0 and (pv_current | float(0) > 0 or recovery_active) -%}
                   charge
                 {%- else -%}
                   stop
