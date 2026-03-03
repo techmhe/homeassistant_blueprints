@@ -29,8 +29,9 @@ blueprint:
   description: >
     Steuert den Marstek Venus A Batteriespeicher via Modbus-Integration für eine
     Nulleinspeisung. Nutzt einen Leistungsmesser (z.B. Shelly Pro3 EM) zur Messung
-    der Netzleistung und regelt die Lade-/Entladeleistung des Speichers automatisch,
-    sodass möglichst kein Strom ins Netz eingespeist wird.
+    der Netzleistung und regelt die Entladeleistung automatisch, sodass möglichst
+    kein Strom ins Netz eingespeist wird. PV-Überschuss wird automatisch über den
+    MPPT des Geräts in die Batterie geleitet – unabhängig vom Force Mode.
 
 
     Funktionen:
@@ -41,7 +42,7 @@ blueprint:
 
     - Einstellbarer minimaler Netzbezug
 
-    - Einstellbare maximale Netzeinspeisung (Export-Toleranz)
+    - Einstellbare Totband-Toleranz um den Ziel-Netzbezug
 
     - Einstellbare maximale Lade- und Entladeleistung
 
@@ -51,8 +52,10 @@ blueprint:
 
     - Schrittweise Entladung (Rampe) zum Schutz der Hardware
 
-    - Automatische Force-Mode-Steuerung basierend auf PV-Eingangsleistung
-      (laden bei PV-Überschuss, entladen bei Netzbezug)
+    - SOC-Recovery: Notladen aus dem Netz, wenn Batterie kritisch leer
+
+    - PV-Passthrough: Wenn Batterie voll (SOC ≥ max. SOC) und PV aktiv, wird
+      PV-Leistung automatisch über den Wechselrichter ins Haus/Netz geleitet
 
 
     Voraussetzungen:
@@ -435,14 +438,14 @@ action:
           # Set charge power to 0 (manual mode only discharges)
           - service: number.set_value
             target:
-              entity_id: !input charge_power_number
+              entity_id: "{{ charge_entity }}"
             data:
               value: 0
 
           # Set the discharge power
           - service: number.set_value
             target:
-              entity_id: !input discharge_power_number
+              entity_id: "{{ discharge_entity }}"
             data:
               value: "{{ effective_discharge | round(0) | int }}"
 
@@ -522,17 +525,24 @@ action:
                   {{ net }}
                 {%- endif -%}
               # Discharge target: how much to discharge (W), 0 if net <= 0
-              # Respects SOC minimum and max discharge power limits
+              # Respects SOC minimum and max discharge power limits.
+              # PV pass-through failsafe: when battery is full (SOC >= max_soc) and
+              # PV is producing, discharge at PV power to protect battery and allow
+              # solar energy to flow to house/grid via the AC inverter.
               discharge_target: >
-                {%- set net = new_net | float(0) -%}
-                {%- if net > 0 -%}
-                  {%- if soc | float(0) <= min_soc_value | float(0) -%}
-                    {{ 0 }}
-                  {%- else -%}
-                    {{ [net, max_discharge_value | float(0)] | min }}
-                  {%- endif -%}
+                {%- if soc | float(0) >= max_soc_value | float(0) and pv_power | float(0) > 0 -%}
+                  {{ [pv_power | float(0), max_discharge_value | float(0)] | min }}
                 {%- else -%}
-                  {{ 0 }}
+                  {%- set net = new_net | float(0) -%}
+                  {%- if net > 0 -%}
+                    {%- if soc | float(0) <= min_soc_value | float(0) -%}
+                      {{ 0 }}
+                    {%- else -%}
+                      {{ [net, max_discharge_value | float(0)] | min }}
+                    {%- endif -%}
+                  {%- else -%}
+                    {{ 0 }}
+                  {%- endif -%}
                 {%- endif -%}
               # Charge target: how much to charge (W), 0 if net >= 0
               # Respects SOC maximum and max charge power limits.
@@ -613,17 +623,23 @@ action:
                 {%- else -%}
                   {{ net }}
                 {%- endif -%}
-              # Final discharge target with fresh SOC
+              # Final discharge target with fresh SOC.
+              # PV pass-through failsafe: when battery is full (SOC >= max_soc) and
+              # PV is producing, discharge at PV power to protect battery.
               discharge_target_final: >
-                {%- set net = new_net_final | float(0) -%}
-                {%- if net > 0 -%}
-                  {%- if soc_current | float(0) <= min_soc_value | float(0) -%}
-                    {{ 0 }}
-                  {%- else -%}
-                    {{ [net, max_discharge_value | float(0)] | min }}
-                  {%- endif -%}
+                {%- if soc_current | float(0) >= max_soc_value | float(0) and pv_current | float(0) > 0 -%}
+                  {{ [pv_current | float(0), max_discharge_value | float(0)] | min }}
                 {%- else -%}
-                  {{ 0 }}
+                  {%- set net = new_net_final | float(0) -%}
+                  {%- if net > 0 -%}
+                    {%- if soc_current | float(0) <= min_soc_value | float(0) -%}
+                      {{ 0 }}
+                    {%- else -%}
+                      {{ [net, max_discharge_value | float(0)] | min }}
+                    {%- endif -%}
+                  {%- else -%}
+                    {{ 0 }}
+                  {%- endif -%}
                 {%- endif -%}
               # Final charge target with fresh SOC
               charge_target_final: >
@@ -655,17 +671,19 @@ action:
                   {{ target }}
                 {%- endif -%}
               # Determine force mode:
-              # - "discharge" if we have a positive discharge target
-              # - "charge" if we have a positive charge target AND (PV is producing
-              #   OR recovery is active — recovery allows charging from grid)
-              # - "stop" otherwise (idle)
+              # - "charge" ONLY when recovery is active (SOC critically low):
+              #   forces AC-side grid charging; PV surplus is handled automatically
+              #   by the MPPT (DC side) regardless of force mode.
+              # - "discharge" if we have a positive discharge target (including PV
+              #   pass-through when battery is full)
+              # - "stop" otherwise (MPPT continues to charge from PV autonomously)
               force_mode_option: >
                 {%- set rec = recovery_soc_value | float(0) -%}
                 {%- set recovery_active = rec > 0 and soc_current | float(0) <= rec -%}
-                {%- if ramped_discharge | float(0) > 0 -%}
-                  discharge
-                {%- elif charge_target_final | float(0) > 0 and (pv_current | float(0) > 0 or recovery_active) -%}
+                {%- if recovery_active -%}
                   charge
+                {%- elif ramped_discharge | float(0) > 0 -%}
+                  discharge
                 {%- else -%}
                   stop
                 {%- endif -%}
@@ -720,7 +738,7 @@ action:
                 target:
                   entity_id: !input charge_power_number
                 data:
-                  value: "{{ charge_target_final | round(0) | int }}"
+                  value: "{{ charge_target_final | round(0) | int if force_mode_option == 'charge' else 0 }}"
 
           # Set the force mode last – the power values are already set correctly
           - service: select.select_option
@@ -742,12 +760,12 @@ action:
           logger: "blueprint.marstek_nulleinspeisung"
       - service: number.set_value
         target:
-          entity_id: !input discharge_power_number
+          entity_id: "{{ discharge_entity }}"
         data:
           value: 0
       - service: number.set_value
         target:
-          entity_id: !input charge_power_number
+          entity_id: "{{ charge_entity }}"
         data:
           value: 0
       - service: select.select_option

@@ -4,15 +4,27 @@ Home Assistant Automation Blueprint zur automatischen Nulleinspeisung mit dem **
 
 ## Funktionen
 
-- **Automatische Nulleinspeisung** – Regelt Lade-/Entladeleistung so, dass kein (oder nur minimaler) Strom ins Netz eingespeist wird
-- **Automatische Force-Mode-Steuerung** – Setzt den Force Mode automatisch auf „laden" bei PV-Überschuss und „entladen" bei Netzbezug
+- **Automatische Nulleinspeisung** – Regelt Entladeleistung so, dass kein (oder nur minimaler) Strom ins Netz eingespeist wird
 - **Manuelle Einspeisung** – Feste Entladeleistung manuell vorgeben (hat Vorrang vor Nulleinspeisung)
 - **Minimaler Netzbezug** – Einstellbar, wie viel Leistung immer aus dem Netz bezogen werden soll
-- **Maximale Netzeinspeisung** – Erlaubte Einspeiseleistung ins Netz konfigurierbar (0 W = echte Nulleinspeisung)
+- **Konfigurierbare Totband-Toleranz** – Symmetrisches Totband um den Ziel-Netzbezug (weniger Modbus-Schreibzugriffe)
 - **Maximale Lade-/Entladeleistung** – Leistungsgrenzen der Batterie einstellbar
 - **SOC-Schutz** – Minimaler und maximaler Ladezustand konfigurierbar
+- **SOC-Recovery** – Automatisches Notladen aus dem Netz, wenn der SOC unter einen kritischen Schwellwert fällt
+- **PV-Passthrough** – Wenn die Batterie voll ist (SOC ≥ max. SOC) und PV erzeugt wird, gibt der Wechselrichter die PV-Leistung direkt ins Haus/Netz ab (verhindert Abregelung)
 - **Entladeverzögerung** – Kurze Lastspitzen werden gefiltert; Entladung startet erst nach konfigurierbarer Wartezeit
 - **Schrittweise Entladung** – Batterie rampt schrittweise hoch statt sofort mit voller Leistung zu entladen
+
+## Hardware-Architektur (Marstek Venus A)
+
+Der Marstek Venus A verfügt über zwei unabhängige Energiepfade:
+
+| Seite | Beschreibung |
+|---|---|
+| **DC / MPPT** | PV → Batterie. Läuft **immer automatisch**, unabhängig vom Force Mode. |
+| **AC / Wechselrichter** | `discharge`: Batterie+PV → Haus/Netz · `charge`: Netz → Batterie · `stop`: AC-Seite inaktiv (MPPT läuft weiter) |
+
+**Wichtig:** `force_mode = charge` bedeutet AC-seitiges Laden **aus dem Netz**. PV-Überschuss wird dagegen automatisch vom MPPT aufgenommen – dafür ist kein `charge`-Force-Mode nötig. Der Blueprint setzt `charge` daher **ausschließlich** beim SOC-Recovery (Notladen aus dem Netz).
 
 ## Voraussetzungen
 
@@ -29,6 +41,7 @@ Home Assistant Automation Blueprint zur automatischen Nulleinspeisung mit dem **
 |---|---|
 | Entladeleistung einstellen | `number.marstek_venus_modbus_entladeleistung_einstellen` |
 | Ladeleistung einstellen | `number.marstek_venus_modbus_ladeleistung_einstellen` |
+| Force Mode Auswahl | `select.marstek_venus_modbus_force_mode` |
 | Batterie-Ladezustand (SOC) | `sensor.marstek_venus_a_batterie_ladezustand` |
 | PV-Eingangsleistung | `sensor.marstek_venus_a_pv_eingangsleistung` |
 
@@ -89,15 +102,17 @@ Vor dem Erstellen der Automatisierung müssen drei Helfer in Home Assistant ange
 | **Batterie-Ladezustand** | SOC-Sensor des Marstek Venus A | – |
 | **Entladeleistung einstellen** | Number-Entity der Modbus-Integration | – |
 | **Ladeleistung einstellen** | Number-Entity der Modbus-Integration | – |
+| **Force Mode Auswahl** | Select-Entity der Modbus-Integration | – |
 | **Nulleinspeisung aktivieren** | Input Boolean Helfer | – |
 | **Manuelle Einspeisung aktivieren** | Input Boolean Helfer | – |
 | **Manuelle Entladeleistung** | Input Number Helfer (Watt) | – |
 | **Minimaler Netzbezug** | Mindest-Import aus dem Netz (W) | 0 W |
-| **Maximale Netzeinspeisung** | Erlaubter Export ins Netz (W) | 0 W |
-| **Maximale Entladeleistung** | Max. Batterie-Entladung (W) | 800 W |
-| **Maximale Ladeleistung** | Max. Batterie-Ladung (W) | 800 W |
-| **Minimaler SOC** | Untergrenze Ladezustand (%) | 10 % |
-| **Maximaler SOC** | Obergrenze Ladezustand (%) | 100 % |
+| **Totband (W)** | Symmetrische Toleranz um den Ziel-Netzbezug | 10 W |
+| **Maximale Entladeleistung** | Max. Batterie-Entladung / PV-Passthrough (W) | 800 W |
+| **Maximale Ladeleistung** | Max. Batterie-Ladung aus dem Netz via Recovery (W) | 800 W |
+| **Minimaler SOC** | Untergrenze Ladezustand – darunter keine Entladung (%) | 10 % |
+| **Maximaler SOC** | Obergrenze – darüber kein Laden, PV-Passthrough aktiv (%) | 100 % |
+| **Recovery SOC** | Notladen aus dem Netz wenn SOC ≤ dieser Wert; 0 = deaktiviert (%) | 0 % |
 | **Entladeverzögerung** | Wartezeit vor Start der Entladung (s) | 3 s |
 | **Entlade-Schrittweite** | Max. Erhöhung pro Zyklus (W) | 200 W |
 
@@ -105,33 +120,38 @@ Vor dem Erstellen der Automatisierung müssen drei Helfer in Home Assistant ange
 
 ### Regelungsalgorithmus
 
-Die Automatisierung läuft als proportionaler Regler mit Totzone:
+Die Automatisierung läuft als proportionaler Regler mit symmetrischem Totband:
 
 1. **Netzleistung messen** – Aktuellen Import/Export am Netzanschluss lesen
-2. **PV-Eingangsleistung lesen** – Aktuelle Solarleistung erfassen
-3. **Soll-Leistung berechnen** – Lade-/Entladeleistung so anpassen, dass der Netzbezug auf den eingestellten minimalen Netzbezug geregelt wird
-4. **Grenzen anwenden** – SOC-Limits und Leistungsgrenzen einhalten
+2. **PV-Eingangsleistung lesen** – Aktuelle Solarleistung erfassen (nicht verfügbar → 0 W)
+3. **Soll-Leistung berechnen** – Entladeleistung so anpassen, dass der Netzbezug auf den eingestellten minimalen Netzbezug geregelt wird
+4. **Grenzen anwenden** – SOC-Limits, Leistungsgrenzen und PV-Passthrough-Failsafe einhalten
 5. **Lastspitzen filtern** – Beim Start der Entladung (aus dem Ruhezustand) wird die konfigurierte Verzögerung abgewartet
 6. **Rampe anwenden** – Entladeleistung wird schrittweise erhöht, nicht sprunghaft
-7. **Force Mode setzen** – Automatisch „entladen" bei Netzbezug, „laden" bei PV-Überschuss, „halt" bei Inaktivität
+7. **Force Mode setzen** – Prioritätsreihenfolge: Recovery → Entladen → Stop
 8. **Marstek steuern** – Neue Lade-/Entladeleistung per Modbus setzen
 
 ```
-Totzone = [Min. Netzbezug − Max. Einspeisung, Min. Netzbezug + 10 W]
+Totzone = [Min. Netzbezug − Totband, Min. Netzbezug + Totband]
 
 Wenn Netzimport oberhalb Totzone:
     → Entladeleistung erhöhen (schrittweise per Rampe)
     → Force Mode = entladen
 
 Wenn Netzexport unterhalb Totzone:
-    → Entladeleistung reduzieren oder Batterie laden (sofort)
-    → Force Mode = laden (nur wenn PV-Eingangsleistung > 0 und Ladeziel > 0)
+    → Entladeleistung reduzieren (sofort)
+    → Force Mode = stop (MPPT lädt Batterie aus PV automatisch weiter)
 
 Wenn innerhalb Totzone:
     → Keine Änderung (Oszillation vermeiden)
 
-Wenn weder Entladung noch Ladung aktiv:
-    → Force Mode = halt
+Wenn SOC ≥ Maximaler SOC und PV > 0 (PV-Passthrough):
+    → Entladeleistung = PV-Leistung (begrenzt auf max. Entladeleistung)
+    → Force Mode = entladen (PV wird über Wechselrichter ins Haus/Netz geleitet)
+
+Wenn SOC ≤ Recovery SOC (Recovery aktiv):
+    → Ladeleistung = max. Ladeleistung (auch aus dem Netz)
+    → Force Mode = laden (höchste Priorität)
 
 Beim Start der Entladung aus dem Ruhezustand:
     → Erst X Sekunden warten (Lastspitzen filtern)
@@ -150,8 +170,10 @@ Beim Start der Entladung aus dem Ruhezustand:
 
 - **SOC-Schutz unten**: Batterie wird nicht entladen wenn SOC ≤ Minimaler SOC
 - **SOC-Schutz oben**: Batterie wird nicht geladen wenn SOC ≥ Maximaler SOC
+- **PV-Passthrough**: Wenn Batterie voll (SOC ≥ max. SOC) und PV aktiv → Entladung mit PV-Leistung, damit der Wechselrichter PV ins Haus/Netz leitet
+- **SOC-Recovery**: Wenn SOC ≤ Recovery SOC (und > 0 konfiguriert) → Notladen aus dem Netz mit maximaler Ladeleistung bis SOC = min. SOC
 - **Leistungsbegrenzung**: Lade-/Entladeleistung wird auf die konfigurierten Maximalwerte begrenzt
-- **Sensorprüfung**: Automation pausiert bei nicht verfügbaren Sensoren
+- **Sensorprüfung**: Automation pausiert bei nicht verfügbaren Grid- oder SOC-Sensoren; PV-Sensor-Ausfall wird als 0 W behandelt (Nachtbetrieb bleibt funktionsfähig)
 - **Lastspitzenfilter**: Entladung startet erst nach konfigurierbarer Verzögerung (Standard: 3 s)
 - **Sanfter Anlauf**: Entladeleistung wird schrittweise erhöht (Standard: 200 W pro Zyklus), Reduzierung erfolgt sofort
 
@@ -164,15 +186,17 @@ PV-Eingangsleistung Sensor: sensor.marstek_venus_a_pv_eingangsleistung
 Batterie-Ladezustand:       sensor.marstek_venus_a_batterie_ladezustand
 Entladeleistung einstellen:  number.marstek_venus_modbus_entladeleistung_einstellen
 Ladeleistung einstellen:     number.marstek_venus_modbus_ladeleistung_einstellen
+Force Mode Auswahl:          select.marstek_venus_modbus_force_mode
 Nulleinspeisung aktivieren:  input_boolean.nulleinspeisung_aktiv
 Manuelle Einspeisung:        input_boolean.manuelle_einspeisung_aktiv
 Manuelle Entladeleistung:    input_number.manuelle_entladeleistung
 Minimaler Netzbezug:         50 W
-Maximale Netzeinspeisung:    0 W
+Totband:                     10 W
 Maximale Entladeleistung:    800 W
 Maximale Ladeleistung:       800 W
 Minimaler SOC:               10 %
 Maximaler SOC:               100 %
+Recovery SOC:                0 %  (deaktiviert)
 Entladeverzögerung:          3 s
 Entlade-Schrittweite:        200 W
 ```

@@ -107,15 +107,37 @@ TPL_NEW_NET = """
 """
 
 TPL_DISCHARGE_TARGET = """
-{%- set net = new_net | float(0) -%}
-{%- if net > 0 -%}
-  {%- if soc | float(0) <= min_soc_value | float(0) -%}
-    {{ 0 }}
-  {%- else -%}
-    {{ [net, max_discharge_value | float(0)] | min }}
-  {%- endif -%}
+{%- if soc | float(0) >= max_soc_value | float(0) and pv_power | float(0) > 0 -%}
+  {{ [pv_power | float(0), max_discharge_value | float(0)] | min }}
 {%- else -%}
-  {{ 0 }}
+  {%- set net = new_net | float(0) -%}
+  {%- if net > 0 -%}
+    {%- if soc | float(0) <= min_soc_value | float(0) -%}
+      {{ 0 }}
+    {%- else -%}
+      {{ [net, max_discharge_value | float(0)] | min }}
+    {%- endif -%}
+  {%- else -%}
+    {{ 0 }}
+  {%- endif -%}
+{%- endif -%}
+"""
+
+# Post-delay version: uses soc_current / pv_current / new_net_final
+TPL_DISCHARGE_TARGET_FINAL = """
+{%- if soc_current | float(0) >= max_soc_value | float(0) and pv_current | float(0) > 0 -%}
+  {{ [pv_current | float(0), max_discharge_value | float(0)] | min }}
+{%- else -%}
+  {%- set net = new_net_final | float(0) -%}
+  {%- if net > 0 -%}
+    {%- if soc_current | float(0) <= min_soc_value | float(0) -%}
+      {{ 0 }}
+    {%- else -%}
+      {{ [net, max_discharge_value | float(0)] | min }}
+    {%- endif -%}
+  {%- else -%}
+    {{ 0 }}
+  {%- endif -%}
 {%- endif -%}
 """
 
@@ -158,10 +180,10 @@ TPL_RAMPED_DISCHARGE = """
 TPL_FORCE_MODE = """
 {%- set rec = recovery_soc_value | float(0) -%}
 {%- set recovery_active = rec > 0 and soc_current | float(0) <= rec -%}
-{%- if ramped_discharge | float(0) > 0 -%}
-  discharge
-{%- elif charge_target_final | float(0) > 0 and (pv_current | float(0) > 0 or recovery_active) -%}
+{%- if recovery_active -%}
   charge
+{%- elif ramped_discharge | float(0) > 0 -%}
+  discharge
 {%- else -%}
   stop
 {%- endif -%}
@@ -253,7 +275,9 @@ def run_zero_feed_in(
     ctx["current_charge_actual"] = cur_c
     ctx["current_net_actual"] = current_net
     ctx["new_net_final"] = new_net
-    ctx["discharge_target_final"] = discharge_target
+
+    discharge_target_final = float(render_template(TPL_DISCHARGE_TARGET_FINAL, ctx))
+    ctx["discharge_target_final"] = discharge_target_final
     ctx["charge_target_final"] = charge_target
 
     ramped_discharge = float(render_template(TPL_RAMPED_DISCHARGE, ctx))
@@ -261,6 +285,10 @@ def run_zero_feed_in(
 
     force_mode = render_template(TPL_FORCE_MODE, ctx)
     ctx["force_mode_option"] = force_mode
+
+    # Reflect the fixed Modbus write behaviour: charge entity receives
+    # charge_target only when force_mode == 'charge'; 0 otherwise.
+    written_charge = charge_target if force_mode == "charge" else 0.0
 
     return {
         "grid": grid_val,
@@ -273,7 +301,9 @@ def run_zero_feed_in(
         "upper_bound": upper_bound,
         "new_net": new_net,
         "discharge_target": discharge_target,
+        "discharge_target_final": discharge_target_final,
         "charge_target": charge_target,
+        "written_charge": written_charge,
         "starting_discharge": starting_discharge,
         "ramped_discharge": ramped_discharge,
         "force_mode": force_mode,
@@ -354,8 +384,13 @@ class TestZeroFeedInBasicScenarios:
         assert result["ramped_discharge"] == 200.0
         assert result["force_mode"] == "discharge"
 
-    def test_idle_grid_exporting_with_pv_should_charge(self):
-        """Battery idle, grid exporting 300W, PV active → should charge."""
+    def test_idle_grid_exporting_with_pv_mppt_charges(self):
+        """Battery idle, grid exporting 300W, PV active → MPPT charges automatically.
+
+        force_mode stays 'stop' because AC-side grid charging is not needed when
+        PV is available. The MPPT (DC side) handles PV → battery charging autonomously.
+        force_mode='charge' is reserved for recovery (grid charging) only.
+        """
         result = run_zero_feed_in(
             grid=-300, pv=500, soc=50,
             discharge_setting=0, charge_setting=0
@@ -363,7 +398,7 @@ class TestZeroFeedInBasicScenarios:
         assert result["new_net"] == -300.0
         assert result["charge_target"] == 300.0
         assert result["ramped_discharge"] == 0.0
-        assert result["force_mode"] == "charge"
+        assert result["force_mode"] == "stop"
 
     def test_grid_within_dead_band_no_change(self):
         """Grid at 5W (within [0, 10] dead band) → no adjustment."""
@@ -436,40 +471,51 @@ class TestSOCProtection:
         assert result["discharge_target"] == 300.0
         assert result["ramped_discharge"] > 0
 
-    def test_high_soc_prevents_charging(self):
-        """SOC at max (100%) → should NOT charge even if PV is exporting."""
+    def test_high_soc_triggers_pv_passthrough(self):
+        """SOC at max (100%) with PV → charge blocked, PV discharged to house/grid.
+
+        Battery is full; MPPT cannot absorb more PV. The failsafe discharges at
+        PV power through the AC inverter so solar energy is not curtailed.
+        """
         result = run_zero_feed_in(
             grid=-500, pv=600, soc=100,
             discharge_setting=0, charge_setting=0
         )
         assert result["charge_target"] == 0.0
-        assert result["force_mode"] == "stop"
+        # PV pass-through: discharge_target_final = min(600, 800) = 600
+        assert result["discharge_target_final"] == 600.0
+        # Ramped from 0: min(600, 0+200) = 200
+        assert result["ramped_discharge"] == 200.0
+        assert result["force_mode"] == "discharge"
 
-    def test_soc_just_below_max_allows_charging(self):
-        """SOC just below max (99%) → should charge normally."""
+    def test_soc_just_below_max_pv_charges_via_mppt(self):
+        """SOC just below max (99%) with PV surplus → MPPT charges automatically.
+
+        force_mode='stop' because no recovery is active; MPPT handles PV charging.
+        """
         result = run_zero_feed_in(
             grid=-300, pv=500, soc=99,
             discharge_setting=0, charge_setting=0
         )
         assert result["charge_target"] == 300.0
-        assert result["force_mode"] == "charge"
+        assert result["force_mode"] == "stop"
 
-    def test_full_soc_no_load_pv_producing_does_not_discharge(self):
-        """SOC=100%, no load, PV producing → stop, no discharge into grid.
+    def test_full_soc_pv_producing_triggers_passthrough(self):
+        """SOC=100%, PV producing → PV pass-through to house/grid via AC inverter.
 
-        With PV=500W and no load, grid reads -500W (exporting).
-        The controller wants to charge (new_net=-500) but SOC is full → blocked.
-        Discharge target must stay 0; battery must not export solar to grid.
+        Battery is full, so MPPT would otherwise curtail PV. The failsafe sets
+        discharge_target = pv_power so the AC inverter routes PV to house/grid.
         """
         result = run_zero_feed_in(
             grid=-500, pv=500, soc=100,
             discharge_setting=0, charge_setting=0
         )
-        assert result["new_net"] == -500.0      # controller wants to charge
+        assert result["new_net"] == -500.0      # controller normally wants to charge
         assert result["charge_target"] == 0.0   # blocked by max SOC
-        assert result["discharge_target"] == 0.0  # no discharge triggered
-        assert result["ramped_discharge"] == 0.0
-        assert result["force_mode"] == "stop"
+        # PV pass-through overrides: discharge_target_final = min(500, 800) = 500
+        assert result["discharge_target_final"] == 500.0
+        assert result["ramped_discharge"] == 200.0  # ramped from 0
+        assert result["force_mode"] == "discharge"
 
     def test_below_min_soc_no_pv_stays_stopped(self):
         """SOC below min (18% < 20%), grid importing, no PV → stop, no recovery.
@@ -487,11 +533,11 @@ class TestSOCProtection:
         assert result["ramped_discharge"] == 0.0
         assert result["force_mode"] == "stop"
 
-    def test_below_min_soc_with_pv_surplus_charges(self):
-        """SOC below min (18% < 20%), grid exporting, PV active → charge.
+    def test_below_min_soc_with_pv_surplus_mppt_charges(self):
+        """SOC below min (18% < 20%), grid exporting, PV active → MPPT charges.
 
-        min_soc only blocks discharge. When PV causes grid export (new_net < 0),
-        charging is allowed and will incidentally bring SOC back above min_soc.
+        min_soc only blocks discharge. PV surplus charges the battery automatically
+        via MPPT (DC side). force_mode stays 'stop' — no AC-side grid charging needed.
         """
         result = run_zero_feed_in(
             grid=-300, pv=500, soc=18,
@@ -500,7 +546,7 @@ class TestSOCProtection:
         )
         assert result["discharge_target"] == 0.0
         assert result["charge_target"] == 300.0
-        assert result["force_mode"] == "charge"
+        assert result["force_mode"] == "stop"
 
     def test_above_min_soc_after_recovery_allows_discharge(self):
         """SOC just above min (21% > 20%), grid importing → discharge resumes.
@@ -654,6 +700,42 @@ class TestDeadBand:
         assert result["upper_bound"] == 30.0
         assert result["new_net"] == 300.0  # unchanged, grid within band
 
+    def test_grid_at_exact_upper_bound_stays_inside(self):
+        """Grid exactly at upper bound → still inside dead band (strict > comparison)."""
+        result = run_zero_feed_in(
+            grid=10, pv=0, soc=80,
+            discharge_setting=300, charge_setting=0
+        )
+        # g=10, hi=10: condition is g > hi → 10 > 10 = False → inside band, no change
+        assert result["new_net"] == 300.0
+
+    def test_grid_at_exact_lower_bound_stays_inside(self):
+        """Grid exactly at lower bound → still inside dead band (strict < comparison)."""
+        result = run_zero_feed_in(
+            grid=-10, pv=0, soc=80,
+            discharge_setting=300, charge_setting=0
+        )
+        # g=-10, lo=-10: condition is g < lo → -10 < -10 = False → inside band, no change
+        assert result["new_net"] == 300.0
+
+    def test_grid_one_watt_above_upper_bound_adjusts(self):
+        """Grid 1W above upper bound → outside dead band, adjustment is made."""
+        result = run_zero_feed_in(
+            grid=11, pv=0, soc=80,
+            discharge_setting=300, charge_setting=0
+        )
+        # 11 > 10 → new_net = 300 + 11 - 0 = 311
+        assert result["new_net"] == 311.0
+
+    def test_grid_one_watt_below_lower_bound_adjusts(self):
+        """Grid 1W below lower bound → outside dead band, adjustment is made."""
+        result = run_zero_feed_in(
+            grid=-11, pv=0, soc=80,
+            discharge_setting=300, charge_setting=0
+        )
+        # -11 < -10 → new_net = 300 + (-11) - 0 = 289
+        assert result["new_net"] == 289.0
+
 
 class TestPowerLimits:
     """Test max discharge and charge power limits."""
@@ -704,13 +786,16 @@ class TestForceMode:
         )
         assert result["force_mode"] == "discharge"
 
-    def test_force_mode_charge_with_pv(self):
-        """Charge target > 0 and PV > 0 → charge mode."""
+    def test_force_mode_stop_with_pv_surplus(self):
+        """Charge target > 0 and PV > 0 → stop (MPPT handles PV charging automatically).
+
+        force_mode='charge' is reserved for recovery (grid charging) only.
+        """
         result = run_zero_feed_in(
             grid=-300, pv=500, soc=50,
             discharge_setting=0, charge_setting=0
         )
-        assert result["force_mode"] == "charge"
+        assert result["force_mode"] == "stop"
 
     def test_force_mode_stop_charge_without_pv(self):
         """Charge target > 0 but PV = 0 → stop (don't charge from grid)."""
@@ -733,7 +818,7 @@ class TestForceMode:
         """Force mode output should not contain leading/trailing whitespace."""
         for grid, pv, expected in [
             (300, 0, "discharge"),
-            (-300, 500, "charge"),
+            (-300, 500, "stop"),   # PV surplus: MPPT handles, force_mode=stop
             (5, 0, "stop"),
         ]:
             result = run_zero_feed_in(
@@ -917,7 +1002,11 @@ class TestMultiCycleSimulation:
         assert r["force_mode"] == "discharge"
 
     def test_pv_surplus_charging_scenario(self):
-        """Simulate PV surplus scenario: house=200W, PV=500W → charge 300W."""
+        """Simulate PV surplus scenario: house=200W, PV=500W → MPPT charges 300W.
+
+        force_mode stays 'stop' because PV charging is handled automatically by MPPT.
+        The controller computes charge_target=300W but does not activate AC-side charging.
+        """
         house_load = 200
         pv = 500
         soc = 50
@@ -929,16 +1018,15 @@ class TestMultiCycleSimulation:
         r = run_zero_feed_in(grid=grid, pv=pv, soc=soc,
                              discharge_setting=cur_discharge, charge_setting=cur_charge)
         assert r["charge_target"] == 300.0
-        assert r["force_mode"] == "charge"
-        cur_charge = r["charge_target"]
+        assert r["force_mode"] == "stop"  # MPPT handles PV, no AC-side charging needed
+        cur_charge = r["written_charge"]  # 0 (not written when force_mode=stop)
 
-        # Next cycle: grid = 200 - 500 + 300 = 0 → within dead band
+        # Next cycle: charge entity stays 0 (written_charge=0 with stop), grid still -300
         grid = house_load - pv + cur_charge
         r = run_zero_feed_in(grid=grid, pv=pv, soc=soc,
                              discharge_setting=0, charge_setting=cur_charge)
-        assert r["new_net"] == -300.0  # maintain current
         assert r["charge_target"] == 300.0
-        assert r["force_mode"] == "charge"
+        assert r["force_mode"] == "stop"
 
 
 class TestDelayAndReRead:
@@ -955,15 +1043,20 @@ class TestDelayAndReRead:
         post_grid: float,
         soc: float,
         config: dict | None = None,
+        pre_pv: float = 0,
+        post_pv: float | None = None,
     ) -> dict:
         """
         Simulate a cycle where pre-delay and post-delay readings differ.
         The pre-delay values trigger starting_discharge; post-delay values
         may cause the controller to re-evaluate.
+
+        pre_pv / post_pv: PV power before and after the delay. post_pv defaults
+        to pre_pv (no change) when not specified.
         """
         entities_pre = {
             "sensor.grid_power": pre_grid,
-            "sensor.pv_power": 0,
+            "sensor.pv_power": pre_pv,
             "sensor.soc": soc,
             "number.discharge": 0,
             "number.charge": 0,
@@ -1006,10 +1099,11 @@ class TestDelayAndReRead:
         starting_discharge_str = render_template(TPL_STARTING_DISCHARGE, ctx)
         starting_discharge = starting_discharge_str.strip().lower() == "true"
 
-        # Simulate post-delay re-read with DIFFERENT grid value
+        # Simulate post-delay re-read with DIFFERENT grid / PV values
+        effective_post_pv = post_pv if post_pv is not None else pv_val
         ctx["grid_current"] = post_grid
         ctx["soc_current"] = soc_val
-        ctx["pv_current"] = pv_val
+        ctx["pv_current"] = effective_post_pv
         ctx["current_discharge_actual"] = cur_d
         ctx["current_charge_actual"] = cur_c
 
@@ -1021,10 +1115,11 @@ class TestDelayAndReRead:
         new_net_final = float(render_template(TPL_NEW_NET, ctx))
         ctx["new_net_final"] = new_net_final
 
-        # Recalculate targets with fresh values
-        ctx["new_net"] = new_net_final
-        discharge_target_final = float(render_template(TPL_DISCHARGE_TARGET, ctx))
+        # Recalculate targets with fresh values (post-delay versions use soc_current/pv_current)
+        discharge_target_final = float(render_template(TPL_DISCHARGE_TARGET_FINAL, ctx))
         ctx["discharge_target_final"] = discharge_target_final
+        # TPL_CHARGE_TARGET uses ctx["new_net"]; point it at the post-delay value
+        ctx["new_net"] = new_net_final
         charge_target_final = float(render_template(TPL_CHARGE_TARGET, ctx))
         ctx["charge_target_final"] = charge_target_final
 
@@ -1038,6 +1133,7 @@ class TestDelayAndReRead:
             "pre_discharge_target": discharge_target,
             "new_net_final": new_net_final,
             "discharge_target_final": discharge_target_final,
+            "charge_target_final": charge_target_final,
             "ramped_discharge": ramped_discharge,
             "force_mode": force_mode,
         }
@@ -1085,6 +1181,25 @@ class TestDelayAndReRead:
         assert result["discharge_target_final"] == 50.0
         assert result["ramped_discharge"] == 50.0  # min(50, 0+200)=50
         assert result["force_mode"] == "discharge"
+
+    def test_pv_appears_during_discharge_delay(self):
+        """
+        Pre-delay: grid importing 400W, no PV → discharge delay triggered.
+        During delay, PV comes online, reversing grid to export (-200W).
+        Post-delay: controller sees PV surplus; MPPT will handle charging.
+        force_mode=stop (no recovery active; AC-side charging not needed).
+        """
+        result = self.run_with_different_post_delay_values(
+            pre_grid=400, post_grid=-200, soc=80,
+            pre_pv=0, post_pv=500,
+        )
+        assert result["starting_discharge"] is True  # delay was triggered
+        # Post-delay: PV=500W, grid=-200W → new_net = 0 + (-200) - 0 = -200
+        assert result["new_net_final"] == -200.0
+        assert result["discharge_target_final"] == 0.0
+        assert result["charge_target_final"] == 200.0
+        assert result["ramped_discharge"] == 0.0
+        assert result["force_mode"] == "stop"  # MPPT handles PV, no AC charging
 
 
 class TestEdgeCases:
@@ -1277,6 +1392,206 @@ class TestSOCRecovery:
         # Recovery forces charge instead
         assert result["charge_target"] == 800.0
         assert result["force_mode"] == "charge"
+
+    def test_recovery_triggers_at_exact_threshold(self):
+        """SOC exactly equals recovery_soc → recovery triggers (condition is soc <= rec)."""
+        result = run_zero_feed_in(
+            grid=0, pv=0, soc=10,
+            discharge_setting=0, charge_setting=0,
+            config=self.RECOVERY_CFG,  # min_soc=20, recovery_soc=10
+        )
+        # soc=10 <= recovery_soc=10 → True → forced charge at max power
+        assert result["charge_target"] == 800.0
+        assert result["force_mode"] == "charge"
+
+    def test_recovery_soc_above_min_soc_takes_priority_over_discharge(self):
+        """recovery_soc > min_soc: recovery wins even when grid is importing.
+
+        Config: recovery_soc=30, min_soc=10.
+        At SOC=20 (below recovery_soc but above min_soc):
+        - Recovery activates → charge_target = max_charge_value
+        - Discharge is NOT blocked by min_soc (soc=20 > min_soc=10)
+        - Grid importing 300W → discharge_target=300W
+        - But force_mode gives recovery priority → 'charge' wins
+        """
+        result = run_zero_feed_in(
+            grid=300, pv=0, soc=20,
+            discharge_setting=0, charge_setting=0,
+            config={"min_soc_value": 10, "recovery_soc_value": 30},
+        )
+        assert result["charge_target"] == 800.0     # recovery wants to charge
+        assert result["discharge_target"] == 300.0  # discharge target still computed
+        assert result["force_mode"] == "charge"     # recovery takes priority
+
+    def test_recovery_soc_above_min_soc_works_without_grid_import(self):
+        """recovery_soc > min_soc: recovery succeeds when grid is balanced (no import)."""
+        result = run_zero_feed_in(
+            grid=0, pv=0, soc=20,
+            discharge_setting=0, charge_setting=0,
+            config={"min_soc_value": 10, "recovery_soc_value": 30},
+        )
+        # Grid=0 is within dead band → new_net=0 → discharge_target=0 (no conflict)
+        assert result["discharge_target"] == 0.0
+        assert result["charge_target"] == 800.0
+        assert result["force_mode"] == "charge"
+
+
+class TestModbusWriteConsistency:
+    """Tests that expose the charge entity ratchet bug.
+
+    When force_mode == 'stop' (grid exporting, PV=0, no recovery), the blueprint
+    computes a non-zero charge_target_final but the Modbus write sequence (else
+    branch) still writes that value to the charge entity:
+
+        else:
+          - number.set_value(discharge_power_number, ramped_discharge)   # 0, correct
+          - number.set_value(charge_power_number, charge_target_final)   # > 0, BUG
+
+    On the next cycle, states(charge_entity) returns this stale non-zero value,
+    which the controller reads as current_charge. This makes current_net negative,
+    so new_net grows even more negative, and charge_target_final grows further —
+    a runaway feedback loop that pins the charge entity at max_charge_value.
+
+    When PV eventually arrives, force_mode becomes 'charge' at max power regardless
+    of actual surplus, causing a large grid import spike and subsequent oscillation.
+    """
+
+    def test_charge_target_nonzero_when_force_mode_stop_no_pv(self):
+        """Grid exporting, PV=0, no recovery → force_mode=stop, written_charge must be 0.
+
+        charge_target (the raw template value) may still be non-zero — that is
+        what the controller *would* charge if allowed. But the Modbus entity must
+        receive 0 so that the next cycle's current_charge stays clean.
+        """
+        result = run_zero_feed_in(
+            grid=-300, pv=0, soc=50,
+            discharge_setting=0, charge_setting=0,
+        )
+        assert result["force_mode"] == "stop"
+        assert result["written_charge"] == 0.0
+
+    def test_charge_entity_ratchets_up_without_pv(self):
+        """Multi-cycle: with the fix, charge entity stays at 0 when grid exports and PV=0.
+
+        Uses written_charge (what the blueprint actually sends to Modbus) as the
+        charge_setting for the next cycle. Pre-fix this ratcheted to 800W; post-fix
+        it must stay at 0 every cycle.
+        """
+        cur_discharge = 0.0
+        cur_charge = 0.0
+
+        for cycle in range(5):
+            result = run_zero_feed_in(
+                grid=-300, pv=0, soc=50,
+                discharge_setting=cur_discharge, charge_setting=cur_charge,
+            )
+            assert result["force_mode"] == "stop", \
+                f"force_mode should be stop on cycle {cycle + 1}"
+            # Use written_charge — what the blueprint actually writes to Modbus.
+            cur_charge = result["written_charge"]
+            cur_discharge = result["ramped_discharge"]
+
+        assert cur_charge == 0.0
+
+    def test_charge_no_overcorrect_when_pv_arrives(self):
+        """With the fix, PV arrival computes correct surplus; force_mode stays stop.
+
+        Pre-fix: 3 stop-mode cycles ratcheted charge entity to 800W, causing the
+        controller to read 800W current_charge when PV arrived, distorting new_net.
+        Post-fix: charge entity stays at 0 during stop cycles, so when PV arrives
+        current_net=0 and charge_target is computed correctly ≈ 300W (the surplus).
+        force_mode='stop' because PV surplus is handled by MPPT, not AC charging.
+        """
+        cur_discharge = 0.0
+        cur_charge = 0.0
+
+        # Phase 1: 3 cycles without PV — charge entity must stay at 0.
+        for _ in range(3):
+            result = run_zero_feed_in(
+                grid=-300, pv=0, soc=50,
+                discharge_setting=cur_discharge, charge_setting=cur_charge,
+            )
+            cur_charge = result["written_charge"]   # 0 after the fix
+            cur_discharge = result["ramped_discharge"]
+
+        # Phase 2: PV arrives, creating a 300W surplus (grid=-300W).
+        result = run_zero_feed_in(
+            grid=-300, pv=500, soc=50,
+            discharge_setting=cur_discharge, charge_setting=cur_charge,
+        )
+        assert result["force_mode"] == "stop"  # MPPT handles PV surplus
+        # current_net = 0 (cur_charge stayed 0), new_net = -300, charge_target = 300.
+        assert result["charge_target"] == 300.0
+
+
+class TestFullBatteryPVPassthrough:
+    """Test PV pass-through when battery is full (SOC >= max_soc).
+
+    When the battery is at max SOC and PV is producing, the MPPT cannot absorb
+    more energy. The failsafe sets discharge_target = pv_power so the AC inverter
+    routes PV through to the house/grid, preventing curtailment.
+    """
+
+    def test_full_battery_pv_discharges_to_grid(self):
+        """SOC=100%, PV=500W → discharge_target_final=500, force_mode=discharge."""
+        result = run_zero_feed_in(
+            grid=-500, pv=500, soc=100,
+            discharge_setting=0, charge_setting=0,
+        )
+        assert result["discharge_target_final"] == 500.0
+        assert result["ramped_discharge"] == 200.0  # ramped from 0: min(500, 200)
+        assert result["force_mode"] == "discharge"
+
+    def test_full_battery_pv_capped_at_max_discharge(self):
+        """SOC=100%, PV=1000W → discharge_target_final capped at max_discharge (800W)."""
+        result = run_zero_feed_in(
+            grid=-800, pv=1000, soc=100,
+            discharge_setting=0, charge_setting=0,
+        )
+        assert result["discharge_target_final"] == 800.0  # capped at max
+
+    def test_full_battery_no_pv_stays_stopped(self):
+        """SOC=100%, no PV → no pass-through, force_mode=stop."""
+        result = run_zero_feed_in(
+            grid=0, pv=0, soc=100,
+            discharge_setting=0, charge_setting=0,
+        )
+        assert result["discharge_target_final"] == 0.0
+        assert result["force_mode"] == "stop"
+
+    def test_passthrough_only_at_max_soc(self):
+        """SOC=99% (below max_soc=100%), PV active → normal control, no passthrough."""
+        result = run_zero_feed_in(
+            grid=-300, pv=500, soc=99,
+            discharge_setting=0, charge_setting=0,
+        )
+        # soc=99 < max_soc=100 → no passthrough; normal logic: charge_target=300
+        assert result["charge_target"] == 300.0
+        assert result["discharge_target_final"] == 0.0
+        assert result["force_mode"] == "stop"
+
+    def test_passthrough_custom_max_soc(self):
+        """Custom max_soc=90%: SOC=90% with PV → pass-through activates."""
+        result = run_zero_feed_in(
+            grid=-200, pv=400, soc=90,
+            discharge_setting=0, charge_setting=0,
+            config={"max_soc_value": 90},
+        )
+        # soc=90 >= max_soc=90 and pv=400 > 0 → passthrough
+        assert result["discharge_target_final"] == 400.0
+        assert result["force_mode"] == "discharge"
+
+    def test_passthrough_continues_while_already_discharging(self):
+        """Battery full with PV: ramped discharge from existing discharge setting."""
+        result = run_zero_feed_in(
+            grid=-500, pv=600, soc=100,
+            discharge_setting=400, charge_setting=0,  # already discharging 400W
+        )
+        # PV=600, max_discharge=800 → discharge_target_final=600
+        assert result["discharge_target_final"] == 600.0
+        # Ramped: target=600 > current=400 → min(600, 400+200) = 600
+        assert result["ramped_discharge"] == 600.0
+        assert result["force_mode"] == "discharge"
 
 
 if __name__ == "__main__":
