@@ -338,22 +338,22 @@ variables:
 ###############################################################################
 trigger:
   # React immediately when the grid power reading changes
-  - platform: state
+  - trigger: state
     entity_id: !input grid_power_sensor
-  # React when PV power changes (e.g. cloud cover)
-  - platform: state
-    entity_id: !input pv_power_sensor
   # Periodic fallback: run every 10 seconds even if no state change occurs
-  - platform: time_pattern
+  # (also picks up PV changes without a dedicated high-frequency PV trigger)
+  - trigger: time_pattern
     seconds: "/10"
   # When the user turns OFF zero-feed-in, we need to stop the battery
-  - platform: state
+  - trigger: state
     entity_id: !input zero_feed_in_enabled
     to: "off"
+    id: "zero_feed_in_off"
   # When the user turns OFF manual feed-in, we need to stop the battery
-  - platform: state
+  - trigger: state
     entity_id: !input manual_feed_in_enabled
     to: "off"
+    id: "manual_feed_in_off"
 
 ###############################################################################
 # Conditions – the automation only runs if at least one mode is active
@@ -372,11 +372,10 @@ condition:
         state: "on"
       # Run if the trigger was one of the mode toggles being turned off
       # (so we can execute the "default" stop action)
-      - condition: template
-        value_template: >
-          {{ trigger.entity_id is defined and
-             (trigger.entity_id == zero_feed_in_entity or
-              trigger.entity_id == manual_feed_in_entity) }}
+      - condition: trigger
+        id:
+          - zero_feed_in_off
+          - manual_feed_in_off
   # Grid power and SOC sensors must be available.
   # PV sensor is NOT required here – it may be unavailable at night when the
   # solar inverter is off. The templates treat unavailable PV as 0 W.
@@ -429,28 +428,28 @@ action:
                 force_mode={{ force_mode_option }}
 
           # Log the action for debugging
-          - service: system_log.write
+          - action: system_log.write
             data:
               message: "Nulleinspeisung [MANUAL]: {{ debug_message }}"
-              level: info
+              level: debug
               logger: "blueprint.marstek_nulleinspeisung"
 
           # Set charge power to 0 (manual mode only discharges)
-          - service: number.set_value
+          - action: number.set_value
             target:
               entity_id: "{{ charge_entity }}"
             data:
               value: 0
 
           # Set the discharge power
-          - service: number.set_value
+          - action: number.set_value
             target:
               entity_id: "{{ discharge_entity }}"
             data:
               value: "{{ effective_discharge | round(0) | int }}"
 
           # Set the force mode (discharge or stop)
-          - service: select.select_option
+          - action: select.select_option
             target:
               entity_id: "{{ force_mode_entity }}"
             data:
@@ -702,10 +701,10 @@ action:
           ###########################################################
 
           # Log the debug summary for easy troubleshooting
-          - service: system_log.write
+          - action: system_log.write
             data:
               message: "Nulleinspeisung {{ debug_message }}"
-              level: info
+              level: debug
               logger: "blueprint.marstek_nulleinspeisung"
 
           # Set charge power to 0 first when discharging (clean transition)
@@ -717,31 +716,31 @@ action:
                 value_template: "{{ force_mode_option == 'discharge' }}"
             then:
               # Discharging: zero out charge first, then set discharge
-              - service: number.set_value
+              - action: number.set_value
                 target:
-                  entity_id: !input charge_power_number
+                  entity_id: "{{ charge_entity }}"
                 data:
                   value: 0
-              - service: number.set_value
+              - action: number.set_value
                 target:
-                  entity_id: !input discharge_power_number
+                  entity_id: "{{ discharge_entity }}"
                 data:
                   value: "{{ ramped_discharge | round(0) | int }}"
             else:
               # Charging or stopping: zero out discharge first, then set charge
-              - service: number.set_value
+              - action: number.set_value
                 target:
-                  entity_id: !input discharge_power_number
+                  entity_id: "{{ discharge_entity }}"
                 data:
                   value: "{{ ramped_discharge | round(0) | int }}"
-              - service: number.set_value
+              - action: number.set_value
                 target:
-                  entity_id: !input charge_power_number
+                  entity_id: "{{ charge_entity }}"
                 data:
                   value: "{{ charge_target_final | round(0) | int if force_mode_option == 'charge' else 0 }}"
 
           # Set the force mode last – the power values are already set correctly
-          - service: select.select_option
+          - action: select.select_option
             target:
               entity_id: "{{ force_mode_entity }}"
             data:
@@ -752,23 +751,23 @@ action:
     # Resets the battery to idle state (no charging, no discharging)
     ###################################################################
     default:
-      - service: system_log.write
+      - action: system_log.write
         data:
           message: >-
             Nulleinspeisung [STOP]: Both modes disabled, stopping battery.
-          level: info
+          level: debug
           logger: "blueprint.marstek_nulleinspeisung"
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: "{{ discharge_entity }}"
         data:
           value: 0
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: "{{ charge_entity }}"
         data:
           value: 0
-      - service: select.select_option
+      - action: select.select_option
         target:
           entity_id: "{{ force_mode_entity }}"
         data:
