@@ -72,22 +72,28 @@ Oder manuell:
 
 Vor dem Erstellen der Automatisierung müssen fünf Helfer in Home Assistant angelegt werden:
 
+Der Name bestimmt die Entity-ID – die unten im Beispiel genutzten IDs entstehen mit
+diesen Namen.
+
 #### Input Boolean: Nulleinspeisung aktivieren
 1. **Einstellungen** → **Geräte & Dienste** → **Helfer** → **Helfer erstellen**
 2. Typ: **Schalter** (Toggle)
-3. Name: `Nulleinspeisung aktiv`
+3. Name: `Nulleinspeisung Toggle`
 
 #### Input Boolean: Manuelle Einspeisung aktivieren
 1. **Helfer erstellen** → Typ: **Schalter** (Toggle)
-2. Name: `Manuelle Einspeisung aktiv`
+2. Name: `Manuelle Einspeisung Toggle`
 
 #### Input Boolean: Maximale Einspeisung aktivieren
 1. **Helfer erstellen** → Typ: **Schalter** (Toggle)
-2. Name: `Maximale Einspeisung aktiv`
+2. Name: `Maximale Einspeisung Toggle`
 
 #### Input Boolean: Speicher wird leergefahren
 1. **Helfer erstellen** → Typ: **Schalter** (Toggle)
-2. Name: `Speicher wird leergefahren`
+2. Name: `Speicher Leerfahren Status`
+3. **Startwert nicht setzen** – sonst erzwingt HA bei jedem Neustart einen festen Wert,
+   statt den letzten wiederherzustellen, und der Latch verliert bei einem Restart
+   mitten im Leerfahren seinen Zustand
 
 > Diesen Schalter **nicht selbst bedienen** – die Automatisierung nutzt ihn als
 > Statusspeicher für den Modus „Maximale Einspeisung" und schaltet ihn selbstständig
@@ -273,11 +279,11 @@ Batterie-Ladezustand:       sensor.marstek_venus_a_batterie_ladezustand
 Entladeleistung einstellen:  number.marstek_venus_modbus_entladeleistung_einstellen
 Ladeleistung einstellen:     number.marstek_venus_modbus_ladeleistung_einstellen
 Force Mode Auswahl:          select.marstek_venus_modbus_force_mode
-Nulleinspeisung aktivieren:  input_boolean.nulleinspeisung_aktiv
-Manuelle Einspeisung:        input_boolean.manuelle_einspeisung_aktiv
+Nulleinspeisung aktivieren:  input_boolean.nulleinspeisung_toggle
+Manuelle Einspeisung:        input_boolean.manuelle_einspeisung_toggle
 Manuelle Entladeleistung:    input_number.manuelle_entladeleistung
-Maximale Einspeisung:        input_boolean.maximale_einspeisung_aktiv
-Speicher wird leergefahren:  input_boolean.speicher_wird_leergefahren
+Maximale Einspeisung:        input_boolean.maximale_einspeisung_toggle
+Speicher wird leergefahren:  input_boolean.speicher_leerfahren_status
 Leerfahren ab SOC:           80 %
 Leerfahren bis SOC:          20 %
 Minimaler Netzbezug:         50 W
@@ -299,15 +305,15 @@ Für eine komfortable Steuerung können Sie folgende Karten zu Ihrem Dashboard h
 type: entities
 title: Marstek Venus A – Steuerung
 entities:
-  - entity: input_boolean.nulleinspeisung_aktiv
+  - entity: input_boolean.nulleinspeisung_toggle
     name: Nulleinspeisung
-  - entity: input_boolean.manuelle_einspeisung_aktiv
+  - entity: input_boolean.manuelle_einspeisung_toggle
     name: Manuelle Einspeisung
   - entity: input_number.manuelle_entladeleistung
     name: Manuelle Leistung
-  - entity: input_boolean.maximale_einspeisung_aktiv
+  - entity: input_boolean.maximale_einspeisung_toggle
     name: Maximale Einspeisung
-  - entity: input_boolean.speicher_wird_leergefahren
+  - entity: input_boolean.speicher_leerfahren_status
     name: Speicher wird leergefahren
   - type: divider
   - entity: sensor.marstek_venus_a_batterie_ladezustand
