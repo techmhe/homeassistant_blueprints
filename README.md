@@ -6,6 +6,7 @@ Home Assistant Automation Blueprint zur automatischen Nulleinspeisung mit dem **
 
 - **Automatische Nulleinspeisung** – Regelt Entladeleistung so, dass kein (oder nur minimaler) Strom ins Netz eingespeist wird
 - **Manuelle Einspeisung** – Feste Entladeleistung manuell vorgeben (hat Vorrang vor Nulleinspeisung)
+- **Maximale Einspeisung (Max-Ertrag)** – Reicht die PV-Leistung verlustfrei durch und fährt den Speicher ab einem einstellbaren SOC gezielt leer, damit für den nächsten PV-Überschuss wieder Platz ist ([Details](#modus-maximale-einspeisung-max-ertrag))
 - **Minimaler Netzbezug** – Einstellbar, wie viel Leistung immer aus dem Netz bezogen werden soll
 - **Konfigurierbare Totband-Toleranz** – Symmetrisches Totband um den Ziel-Netzbezug (weniger Modbus-Schreibzugriffe)
 - **Maximale Lade-/Entladeleistung** – Leistungsgrenzen der Batterie einstellbar
@@ -69,7 +70,7 @@ Oder manuell:
 
 ### 2. Helfer erstellen
 
-Vor dem Erstellen der Automatisierung müssen drei Helfer in Home Assistant angelegt werden:
+Vor dem Erstellen der Automatisierung müssen fünf Helfer in Home Assistant angelegt werden:
 
 #### Input Boolean: Nulleinspeisung aktivieren
 1. **Einstellungen** → **Geräte & Dienste** → **Helfer** → **Helfer erstellen**
@@ -79,6 +80,19 @@ Vor dem Erstellen der Automatisierung müssen drei Helfer in Home Assistant ange
 #### Input Boolean: Manuelle Einspeisung aktivieren
 1. **Helfer erstellen** → Typ: **Schalter** (Toggle)
 2. Name: `Manuelle Einspeisung aktiv`
+
+#### Input Boolean: Maximale Einspeisung aktivieren
+1. **Helfer erstellen** → Typ: **Schalter** (Toggle)
+2. Name: `Maximale Einspeisung aktiv`
+
+#### Input Boolean: Speicher wird leergefahren
+1. **Helfer erstellen** → Typ: **Schalter** (Toggle)
+2. Name: `Speicher wird leergefahren`
+
+> Diesen Schalter **nicht selbst bedienen** – die Automatisierung nutzt ihn als
+> Statusspeicher für den Modus „Maximale Einspeisung" und schaltet ihn selbstständig
+> ein und aus. Er ist bewusst als sichtbarer Helfer umgesetzt, damit man im Dashboard
+> und im Verlauf sieht, ob gerade leergefahren wird.
 
 #### Input Number: Manuelle Entladeleistung
 1. **Helfer erstellen** → Typ: **Zahl** (Number)
@@ -106,6 +120,10 @@ Vor dem Erstellen der Automatisierung müssen drei Helfer in Home Assistant ange
 | **Nulleinspeisung aktivieren** | Input Boolean Helfer | – |
 | **Manuelle Einspeisung aktivieren** | Input Boolean Helfer | – |
 | **Manuelle Entladeleistung** | Input Number Helfer (Watt) | – |
+| **Maximale Einspeisung aktivieren** | Input Boolean Helfer | – |
+| **Helfer: Speicher wird leergefahren** | Input Boolean Helfer – Statusspeicher, wird automatisch gesetzt | – |
+| **Leerfahren ab SOC** | Ab diesem SOC wird der Speicher leergefahren; 0 = deaktiviert (%) | 80 % |
+| **Leerfahren bis SOC** | Bis zu diesem SOC wird leergefahren (%) | 20 % |
 | **Minimaler Netzbezug** | Mindest-Import aus dem Netz (W) | 0 W |
 | **Totband (W)** | Symmetrische Toleranz um den Ziel-Netzbezug | 10 W |
 | **Maximale Entladeleistung** | Max. Batterie-Entladung / PV-Passthrough (W) | 800 W |
@@ -160,11 +178,79 @@ Beim Start der Entladung aus dem Ruhezustand:
 
 ### Betriebsmodi
 
-| Modus | Bedingung | Verhalten |
-|---|---|---|
-| **Nulleinspeisung** | Toggle „Nulleinspeisung" = AN | Automatische Regelung aktiv |
-| **Manuelle Einspeisung** | Toggle „Manuelle Einspeisung" = AN | Feste Entladeleistung (hat Vorrang) |
-| **Inaktiv** | Beide Toggles = AUS | Keine Steuerung durch die Automatisierung |
+Die Modi werden in dieser Reihenfolge geprüft – der erste aktive gewinnt:
+
+| Priorität | Modus | Bedingung | Verhalten |
+|---|---|---|---|
+| 1 | **Manuelle Einspeisung** | Toggle „Manuelle Einspeisung" = AN | Feste Entladeleistung |
+| 2 | **Maximale Einspeisung** | Toggle „Maximale Einspeisung" = AN | PV durchreichen + Speicher leerfahren |
+| 3 | **Nulleinspeisung** | Toggle „Nulleinspeisung" = AN | Automatische Regelung auf den Ziel-Netzbezug |
+| – | **Inaktiv** | Alle Toggles = AUS | Keine Steuerung durch die Automatisierung |
+
+### Modus „Maximale Einspeisung" (Max-Ertrag)
+
+Dieser Modus ist für Anlagen gedacht, bei denen **jede kWh am AC-Ausgang gleich viel
+wert ist** – etwa bei fester Einspeisevergütung. Er ist besonders dann sinnvoll, wenn
+ein **kleiner Speicher auf viel Modulleistung** trifft und die AC-Ausgangsleistung hart
+begrenzt ist (z.B. 2 kWh Speicher, 1,8 kWp Module, 800 W AC).
+
+Die Nulleinspeisung ist in so einem Setup kontraproduktiv: Sie regelt die Abgabe auf
+nahezu Null, der kleine Speicher ist mittags voll – und danach muss der Wechselrichter
+abregeln, der PV-Ertrag verfällt.
+
+**Regeln** (die Reihenfolge ist bindend):
+
+```
+Wenn SOC ≤ Minimaler SOC:
+    → Entladeleistung = 0, Force Mode = stop      (Schutz geht immer vor)
+
+Wenn Leerfahren aktiv (Latch) ODER PV = 0 ODER SOC ≥ Maximaler SOC:
+    → Entladeleistung = max. Entladeleistung
+
+Sonst:
+    → Entladeleistung = PV-Leistung (begrenzt auf max. Entladeleistung)
+```
+
+**Warum PV durchreichen statt konstant Volllast?**
+Bei 400 W PV und konstant 800 W Abgabe werden 400 W aus der Batterie genommen, die
+kurz darauf wieder aus der PV nachgeladen werden. Jeder dieser Durchläufe kostet
+Round-Trip-Wirkungsgrad. Wird stattdessen genau die PV-Leistung abgegeben, liefert der
+MPPT den Strom direkt nach – die Batterie bleibt netto unangetastet, es entstehen keine
+Umwandlungsverluste und kein Micro-Cycling an der SOC-Grenze.
+
+**Warum das Leerfahren (Latch)?**
+Ohne diese Regel pendelt der Ladezustand knapp unter dem maximalen SOC. Kommt nach einer
+Verschattungsphase wieder die volle Modulleistung, ist kein Puffer mehr da und der
+Wechselrichter regelt ab. Deshalb gilt: Erreicht der SOC **„Leerfahren ab SOC"**, wird
+mit voller Entladeleistung entladen – und zwar **durchgehend, bis „Leerfahren bis SOC"
+erreicht ist**, auch wenn der SOC zwischendurch längst wieder unter der oberen Schwelle
+liegt. Danach wird wieder nur die PV-Leistung durchgereicht.
+
+Genau dafür wird der Helfer `Speicher wird leergefahren` gebraucht: Ein Blueprint hat
+kein Gedächtnis über einzelne Durchläufe hinweg, und der Zustand lässt sich auch nicht
+aus der eingestellten Entladeleistung ableiten – bei PV oberhalb der Grenze steht dort
+ebenfalls die volle Entladeleistung, ohne dass leergefahren wird.
+
+**Tagesablauf am Beispiel** (Leerfahren ab 80 %, bis 20 %):
+
+| Situation | PV | SOC | Abgabe | Latch |
+|---|---|---|---|---|
+| Morgens, schwache Sonne | 300 W | 20 % | 300 W | aus |
+| Es klart auf | 1800 W | 25 % | 800 W (1000 W laden den Speicher) | aus |
+| Speicher erreicht Schwelle | 1800 W | 80 % | 800 W | **an** |
+| Verschattung | 400 W | 60 % | 800 W (Speicher wird weiter geleert) | an |
+| Untere Schwelle erreicht | 400 W | 20 % | 400 W | aus |
+| Sonne kommt zurück | 1800 W | 22 % | 800 W – Puffer ist wieder da | aus |
+| Nacht | 0 W | 45 % | 800 W bis Minimaler SOC | aus |
+
+**Hinweise:**
+- Der Netzleistungs-Sensor, das Totband und die Entladeverzögerung werden in diesem
+  Modus nicht verwendet – geregelt wird ausschließlich nach PV und SOC.
+- Fällt der PV-Sensor aus, wird das wie Nacht behandelt (0 W) und der Speicher entladen.
+- „Leerfahren bis SOC" wird nie unter den minimalen SOC gelassen; niedrigere Werte werden
+  automatisch auf diesen angehoben.
+- Höhere Werte bei „Leerfahren bis SOC" bedeuten weniger Ladezyklen, aber auch weniger
+  Puffer für die nächste Sonnenphase.
 
 ### Schutzmechanismen
 
@@ -173,7 +259,7 @@ Beim Start der Entladung aus dem Ruhezustand:
 - **PV-Passthrough**: Wenn Batterie voll (SOC ≥ max. SOC) und PV aktiv → Entladung mit PV-Leistung, damit der Wechselrichter PV ins Haus/Netz leitet
 - **SOC-Recovery**: Wenn SOC ≤ Recovery SOC (und > 0 konfiguriert) → Notladen aus dem Netz mit maximaler Ladeleistung bis SOC = min. SOC
 - **Leistungsbegrenzung**: Lade-/Entladeleistung wird auf die konfigurierten Maximalwerte begrenzt
-- **Sensorprüfung**: Automation pausiert bei nicht verfügbaren Grid- oder SOC-Sensoren; PV-Sensor-Ausfall wird als 0 W behandelt (Nachtbetrieb bleibt funktionsfähig)
+- **Sensorprüfung**: Automation pausiert bei nicht verfügbarem SOC-Sensor. Der Netzsensor wird nur für die Nulleinspeisung benötigt – fällt er aus, laufen die manuelle und die maximale Einspeisung weiter. PV-Sensor-Ausfall wird als 0 W behandelt (Nachtbetrieb bleibt funktionsfähig)
 - **Lastspitzenfilter**: Entladung startet erst nach konfigurierbarer Verzögerung (Standard: 3 s)
 - **Sanfter Anlauf**: Entladeleistung wird schrittweise erhöht (Standard: 200 W pro Zyklus), Reduzierung erfolgt sofort
 
@@ -190,6 +276,10 @@ Force Mode Auswahl:          select.marstek_venus_modbus_force_mode
 Nulleinspeisung aktivieren:  input_boolean.nulleinspeisung_aktiv
 Manuelle Einspeisung:        input_boolean.manuelle_einspeisung_aktiv
 Manuelle Entladeleistung:    input_number.manuelle_entladeleistung
+Maximale Einspeisung:        input_boolean.maximale_einspeisung_aktiv
+Speicher wird leergefahren:  input_boolean.speicher_wird_leergefahren
+Leerfahren ab SOC:           80 %
+Leerfahren bis SOC:          20 %
 Minimaler Netzbezug:         50 W
 Totband:                     10 W
 Maximale Entladeleistung:    800 W
@@ -215,6 +305,10 @@ entities:
     name: Manuelle Einspeisung
   - entity: input_number.manuelle_entladeleistung
     name: Manuelle Leistung
+  - entity: input_boolean.maximale_einspeisung_aktiv
+    name: Maximale Einspeisung
+  - entity: input_boolean.speicher_wird_leergefahren
+    name: Speicher wird leergefahren
   - type: divider
   - entity: sensor.marstek_venus_a_batterie_ladezustand
     name: Batterie SOC

@@ -37,6 +37,16 @@ def make_states(entity_values: dict):
     return states
 
 
+def make_is_state(entity_values: dict):
+    """
+    Return a callable ``is_state(entity_id, value)`` matching Home Assistant's
+    template function. Unknown entities never match.
+    """
+    def is_state(entity_id, value):
+        return str(entity_values.get(entity_id, "unavailable")) == value
+    return is_state
+
+
 # ---------------------------------------------------------------------------
 # Default config values (can be overridden per-test)
 # ---------------------------------------------------------------------------
@@ -50,6 +60,8 @@ DEFAULT_CONFIG = dict(
     recovery_soc_value=0,
     discharge_delay_value=3,
     discharge_step_value=200,
+    dump_start_soc_value=80,
+    dump_stop_soc_value=20,
 )
 
 
@@ -58,6 +70,7 @@ def build_context(entity_values: dict, config_overrides: dict | None = None):
     cfg = {**DEFAULT_CONFIG, **(config_overrides or {})}
     ctx = {
         "states": make_states(entity_values),
+        "is_state": make_is_state(entity_values),
         "grid_power_entity": "sensor.grid_power",
         "pv_power_entity": "sensor.pv_power",
         "soc_entity": "sensor.soc",
@@ -65,6 +78,7 @@ def build_context(entity_values: dict, config_overrides: dict | None = None):
         "charge_entity": "number.charge",
         "force_mode_entity": "select.force_mode",
         "manual_power_entity": "input_number.manual_power",
+        "dump_helper_entity": "input_boolean.dump_active",
         **cfg,
     }
     return ctx
@@ -204,6 +218,124 @@ TPL_MANUAL_FORCE_MODE = """
   stop
 {%- endif -%}
 """
+
+
+# ---------------------------------------------------------------------------
+# Templates extracted from the blueprint (max-yield / "Maximale Einspeisung")
+# ---------------------------------------------------------------------------
+
+TPL_MY_DUMP_FLOOR = (
+    "{{ [dump_stop_soc_value | float(0), min_soc_value | float(0)] | max }}"
+)
+
+TPL_MY_DUMP_START = """
+{{ dump_start_soc_value | float(0) > 0 and
+   soc | float(0) >= dump_start_soc_value | float(0) }}
+"""
+
+TPL_MY_DUMP_STOP = "{{ soc | float(0) <= dump_floor | float(0) }}"
+
+TPL_MY_DUMPING = """
+{{ dump_start or
+   (is_state(dump_helper_entity, 'on') and not dump_stop) }}
+"""
+
+TPL_MY_DISCHARGE_TARGET = """
+{%- if soc | float(0) <= min_soc_value | float(0) -%}
+  {{ 0 }}
+{%- elif dumping or pv_power | float(0) <= 0 or
+         soc | float(0) >= max_soc_value | float(0) -%}
+  {{ max_discharge_value | float(0) }}
+{%- else -%}
+  {{ [pv_power | float(0), max_discharge_value | float(0)] | min }}
+{%- endif -%}
+"""
+
+TPL_MY_RAMPED_DISCHARGE = """
+{%- set target = discharge_target | float(0) -%}
+{%- set current = current_discharge | float(0) -%}
+{%- set step = discharge_step_value | float(0) -%}
+{%- if target > current -%}
+  {{ [target, current + step] | min }}
+{%- else -%}
+  {{ target }}
+{%- endif -%}
+"""
+
+TPL_MY_FORCE_MODE = """
+{%- if ramped_discharge | float(0) > 0 -%}
+  discharge
+{%- else -%}
+  stop
+{%- endif -%}
+"""
+
+
+def run_max_yield(
+    pv: float | str,
+    soc: float,
+    discharge_setting: float | str = 0,
+    dump_helper: str = "off",
+    config: dict | None = None,
+):
+    """
+    Simulate one full max-yield cycle.
+
+    ``dump_helper`` is the current state of the latch helper ('on'/'off').
+    The returned ``dump_helper_next`` is what the automation would write back,
+    so multi-cycle tests can feed it into the following call.
+    """
+    entities = {
+        "sensor.pv_power": pv,
+        "sensor.soc": soc,
+        "number.discharge": discharge_setting,
+        "input_boolean.dump_active": dump_helper,
+    }
+    ctx = build_context(entities, config)
+
+    # Step 1: read state
+    pv_val = float(render_template(TPL_PV_POWER, ctx))
+    soc_val = float(render_template("{{ states(soc_entity) | float(0) }}", ctx))
+    cur_d = float(render_template(TPL_CURRENT_DISCHARGE, ctx))
+
+    ctx["pv_power"] = pv_val
+    ctx["soc"] = soc_val
+    ctx["current_discharge"] = cur_d
+
+    # Step 2: latch thresholds
+    dump_floor = float(render_template(TPL_MY_DUMP_FLOOR, ctx))
+    ctx["dump_floor"] = dump_floor
+    dump_start = render_template(TPL_MY_DUMP_START, ctx).lower() == "true"
+    ctx["dump_start"] = dump_start
+    dump_stop = render_template(TPL_MY_DUMP_STOP, ctx).lower() == "true"
+    ctx["dump_stop"] = dump_stop
+
+    # Step 3: latched dump state and target
+    dumping = render_template(TPL_MY_DUMPING, ctx).lower() == "true"
+    ctx["dumping"] = dumping
+
+    discharge_target = float(render_template(TPL_MY_DISCHARGE_TARGET, ctx))
+    ctx["discharge_target"] = discharge_target
+
+    # Step 4: ramp and force mode
+    ramped_discharge = float(render_template(TPL_MY_RAMPED_DISCHARGE, ctx))
+    ctx["ramped_discharge"] = ramped_discharge
+
+    force_mode = render_template(TPL_MY_FORCE_MODE, ctx)
+
+    return {
+        "pv_power": pv_val,
+        "soc": soc_val,
+        "current_discharge": cur_d,
+        "dump_floor": dump_floor,
+        "dump_start": dump_start,
+        "dump_stop": dump_stop,
+        "dumping": dumping,
+        "dump_helper_next": "on" if dumping else "off",
+        "discharge_target": discharge_target,
+        "ramped_discharge": ramped_discharge,
+        "force_mode": force_mode,
+    }
 
 
 def run_zero_feed_in(
@@ -1592,6 +1724,254 @@ class TestFullBatteryPVPassthrough:
         # Ramped: target=600 > current=400 → min(600, 400+200) = 600
         assert result["ramped_discharge"] == 600.0
         assert result["force_mode"] == "discharge"
+
+
+class TestMaxYieldPassthrough:
+    """Max-yield mode: PV is passed straight through to the AC port."""
+
+    def test_pv_below_cap_is_passed_through(self):
+        """400 W PV, mid SOC → output exactly 400 W, no battery cycling."""
+        result = run_max_yield(pv=400, soc=50, discharge_setting=400)
+        assert result["dumping"] is False
+        assert result["discharge_target"] == 400.0
+        assert result["force_mode"] == "discharge"
+
+    def test_pv_above_cap_is_capped(self):
+        """1800 W PV → output capped at 800 W, MPPT stores the remaining 1000 W."""
+        result = run_max_yield(pv=1800, soc=50, discharge_setting=800)
+        assert result["discharge_target"] == 800.0
+        assert result["ramped_discharge"] == 800.0
+
+    def test_pv_exactly_at_cap(self):
+        result = run_max_yield(pv=800, soc=50, discharge_setting=800)
+        assert result["discharge_target"] == 800.0
+
+    def test_custom_max_discharge_is_respected(self):
+        result = run_max_yield(
+            pv=1800, soc=50, discharge_setting=600,
+            config={"max_discharge_value": 600},
+        )
+        assert result["discharge_target"] == 600.0
+
+    def test_pv_zero_means_night_drain(self):
+        """No PV → drain the battery at full power to free it up for tomorrow."""
+        result = run_max_yield(pv=0, soc=50, discharge_setting=800)
+        assert result["discharge_target"] == 800.0
+        assert result["force_mode"] == "discharge"
+
+    def test_pv_unavailable_behaves_like_night(self):
+        """Consistent with the blueprint-wide 'unavailable PV = 0 W' decision."""
+        result = run_max_yield(pv="unavailable", soc=50, discharge_setting=800)
+        assert result["pv_power"] == 0.0
+        assert result["discharge_target"] == 800.0
+
+    def test_full_battery_dumps_even_with_latch_disabled(self):
+        """max_soc failsafe still applies when dump_start_soc = 0."""
+        result = run_max_yield(
+            pv=400, soc=100, discharge_setting=800,
+            config={"dump_start_soc_value": 0},
+        )
+        assert result["dumping"] is False
+        assert result["discharge_target"] == 800.0
+
+    def test_latch_disabled_otherwise_only_passes_through(self):
+        result = run_max_yield(
+            pv=400, soc=95, discharge_setting=400,
+            config={"dump_start_soc_value": 0},
+        )
+        assert result["dumping"] is False
+        assert result["discharge_target"] == 400.0
+
+
+class TestMaxYieldDumpLatch:
+    """Max-yield mode: the latched dump run that restores battery headroom."""
+
+    def test_latch_engages_at_threshold(self):
+        """SOC reaches dump_start_soc → dump at full power, helper turns on."""
+        result = run_max_yield(pv=400, soc=80, discharge_setting=400, dump_helper="off")
+        assert result["dump_start"] is True
+        assert result["dumping"] is True
+        assert result["discharge_target"] == 800.0
+        assert result["dump_helper_next"] == "on"
+
+    def test_below_threshold_does_not_engage(self):
+        result = run_max_yield(pv=400, soc=79.9, discharge_setting=400, dump_helper="off")
+        assert result["dump_start"] is False
+        assert result["dumping"] is False
+        assert result["discharge_target"] == 400.0
+        assert result["dump_helper_next"] == "off"
+
+    @pytest.mark.parametrize("soc", [79, 50, 21, 20.1])
+    def test_latch_holds_while_draining(self, soc):
+        """Once latched, keep dumping even though SOC is below dump_start_soc."""
+        result = run_max_yield(pv=400, soc=soc, discharge_setting=800, dump_helper="on")
+        assert result["dumping"] is True
+        assert result["discharge_target"] == 800.0
+        assert result["dump_helper_next"] == "on"
+
+    def test_latch_releases_at_floor(self):
+        """SOC reaches dump_stop_soc → helper turns off, back to pass-through."""
+        result = run_max_yield(pv=400, soc=20, discharge_setting=800, dump_helper="on")
+        assert result["dump_stop"] is True
+        assert result["dumping"] is False
+        assert result["discharge_target"] == 400.0
+        assert result["dump_helper_next"] == "off"
+
+    def test_after_release_pv_is_passed_through_again(self):
+        """Latch stays off while the battery refills below dump_start_soc."""
+        result = run_max_yield(pv=400, soc=30, discharge_setting=400, dump_helper="off")
+        assert result["dumping"] is False
+        assert result["discharge_target"] == 400.0
+
+    def test_dump_floor_clamped_to_min_soc(self):
+        """dump_stop_soc below min_soc must not bypass the hard discharge limit."""
+        result = run_max_yield(
+            pv=400, soc=15, discharge_setting=800, dump_helper="on",
+            config={"dump_stop_soc_value": 5, "min_soc_value": 10},
+        )
+        assert result["dump_floor"] == 10.0
+        # 15 % is still above the clamped floor → keep dumping
+        assert result["dumping"] is True
+
+    def test_dump_floor_uses_dump_stop_when_above_min_soc(self):
+        result = run_max_yield(pv=400, soc=50, discharge_setting=800, dump_helper="on")
+        assert result["dump_floor"] == 20.0
+
+    def test_night_drain_does_not_need_the_latch(self):
+        """PV = 0 drains regardless of the helper state."""
+        result = run_max_yield(pv=0, soc=50, discharge_setting=800, dump_helper="off")
+        assert result["dumping"] is False
+        assert result["discharge_target"] == 800.0
+
+
+class TestMaxYieldSOCProtection:
+    """min_soc outranks every dump rule in max-yield mode."""
+
+    def test_at_min_soc_stops(self):
+        result = run_max_yield(pv=400, soc=10, discharge_setting=800, dump_helper="on")
+        assert result["discharge_target"] == 0.0
+        assert result["ramped_discharge"] == 0.0
+        assert result["force_mode"] == "stop"
+
+    def test_below_min_soc_stops(self):
+        result = run_max_yield(pv=0, soc=5, discharge_setting=800, dump_helper="on")
+        assert result["discharge_target"] == 0.0
+        assert result["force_mode"] == "stop"
+
+    def test_just_above_min_soc_still_runs(self):
+        result = run_max_yield(pv=400, soc=10.1, discharge_setting=400)
+        assert result["discharge_target"] == 400.0
+        assert result["force_mode"] == "discharge"
+
+    def test_min_soc_beats_night_drain(self):
+        result = run_max_yield(pv=0, soc=10, discharge_setting=800)
+        assert result["discharge_target"] == 0.0
+        assert result["force_mode"] == "stop"
+
+
+class TestMaxYieldRampUp:
+    """Max-yield mode reuses the hardware-protecting discharge ramp."""
+
+    def test_ramps_up_from_idle(self):
+        result = run_max_yield(pv=1800, soc=50, discharge_setting=0)
+        assert result["discharge_target"] == 800.0
+        assert result["ramped_discharge"] == 200.0
+
+    def test_ramp_reaches_target_over_cycles(self):
+        setting = 0.0
+        seen = []
+        for _ in range(5):
+            result = run_max_yield(pv=1800, soc=50, discharge_setting=setting)
+            setting = result["ramped_discharge"]
+            seen.append(setting)
+        assert seen == [200.0, 400.0, 600.0, 800.0, 800.0]
+
+    def test_ramp_down_is_immediate(self):
+        """PV collapses from 800 W to 100 W → follow down in one cycle."""
+        result = run_max_yield(pv=100, soc=50, discharge_setting=800)
+        assert result["discharge_target"] == 100.0
+        assert result["ramped_discharge"] == 100.0
+
+    def test_stop_is_immediate(self):
+        result = run_max_yield(pv=400, soc=10, discharge_setting=800, dump_helper="on")
+        assert result["ramped_discharge"] == 0.0
+
+
+class TestMaxYieldDayScenario:
+    """End-to-end walkthrough of the scenario this mode was built for.
+
+    2 kWh battery, 1.8 kWp modules, 800 W AC limit, meter where every exported
+    kWh is worth the same as an imported one.
+    """
+
+    def test_full_day(self):
+        cfg = {"min_soc_value": 10, "dump_start_soc_value": 80, "dump_stop_soc_value": 20}
+        helper = "off"
+        setting = 0.0
+
+        def cycle(pv, soc):
+            nonlocal helper, setting
+            r = run_max_yield(
+                pv=pv, soc=soc, discharge_setting=setting,
+                dump_helper=helper, config=cfg,
+            )
+            helper = r["dump_helper_next"]
+            setting = r["ramped_discharge"]
+            return r
+
+        # Morning: battery drained overnight, weak sun → pass 300 W through
+        r = cycle(pv=300, soc=20)
+        assert r["dumping"] is False
+        assert r["discharge_target"] == 300.0
+
+        # Sky clears: 1800 W PV → 800 W out, the rest charges the battery
+        r = cycle(pv=1800, soc=25)
+        assert r["discharge_target"] == 800.0
+
+        # Battery has filled to the dump threshold → latch engages
+        r = cycle(pv=1800, soc=80)
+        assert r["dumping"] is True
+        assert helper == "on"
+        assert r["discharge_target"] == 800.0
+
+        # Shading: only 400 W PV, but the dump run continues to free up capacity
+        r = cycle(pv=400, soc=60)
+        assert r["dumping"] is True
+        assert r["discharge_target"] == 800.0
+
+        # Drained to the floor → latch releases
+        r = cycle(pv=400, soc=20)
+        assert r["dumping"] is False
+        assert helper == "off"
+        assert r["discharge_target"] == 400.0
+
+        # Sun returns at 1800 W and the battery now has headroom again
+        r = cycle(pv=1800, soc=22)
+        assert r["discharge_target"] == 800.0
+
+        # Night: drain what is left so tomorrow's surplus fits
+        r = cycle(pv=0, soc=45)
+        assert r["discharge_target"] == 800.0
+
+        # Down at min_soc → stop
+        r = cycle(pv=0, soc=10)
+        assert r["discharge_target"] == 0.0
+        assert r["force_mode"] == "stop"
+
+    def test_without_latch_headroom_is_lost(self):
+        """Regression guard for why the latch exists at all.
+
+        With the latch disabled the battery idles just below max_soc, so a
+        returning 1.8 kW peak has nowhere to go but the inverter's cap.
+        """
+        no_latch = {"dump_start_soc_value": 0}
+        result = run_max_yield(
+            pv=400, soc=99, discharge_setting=400, config=no_latch,
+        )
+        assert result["discharge_target"] == 400.0  # only PV, battery stays full
+
+        latched = run_max_yield(pv=400, soc=99, discharge_setting=400)
+        assert latched["discharge_target"] == 800.0  # makes room
 
 
 if __name__ == "__main__":

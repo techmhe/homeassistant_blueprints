@@ -40,6 +40,10 @@ blueprint:
 
     - Manuelle Einspeisungssteuerung mit einstellbarer Leistung
 
+    - Maximale Einspeisung (Max-Ertrag): PV-Leistung wird direkt durchgereicht,
+      der Speicher wird ab einem einstellbaren SOC gezielt leergefahren, damit
+      für den nächsten PV-Überschuss wieder Platz ist
+
     - Einstellbarer minimaler Netzbezug
 
     - Einstellbare Totband-Toleranz um den Ziel-Netzbezug
@@ -67,7 +71,8 @@ blueprint:
 
     - PV-Eingangsleistungs-Sensor (Solarleistung)
 
-    - Zwei Input-Boolean-Helfer (Nulleinspeisung ein/aus, Manuelle Einspeisung ein/aus)
+    - Vier Input-Boolean-Helfer (Nulleinspeisung ein/aus, Manuelle Einspeisung ein/aus,
+      Maximale Einspeisung ein/aus, Statushelfer "Speicher wird leergefahren")
 
     - Ein Input-Number-Helfer für die manuelle Entladeleistung
 
@@ -161,6 +166,72 @@ blueprint:
         entity:
           filter:
             domain: input_number
+
+    max_yield_enabled:
+      name: "Maximale Einspeisung aktivieren"
+      description: >
+        Input Boolean zum Aktivieren der maximalen Einspeisung (Max-Ertrag).
+        Statt den Netzbezug zu regeln, wird die PV-Leistung direkt über den
+        Wechselrichter durchgereicht (gedeckelt auf die max. Entladeleistung).
+        Nur der Überschuss oberhalb dieser Grenze landet über den MPPT im Speicher.
+        Ist der Speicher gefüllt oder ist es Nacht, wird mit voller Entladeleistung
+        entladen, damit für den nächsten PV-Überschuss wieder Platz ist.
+        Sinnvoll bei kleinem Speicher und begrenzter AC-Ausgangsleistung (z.B. 800 W).
+        Hat Vorrang vor der automatischen Nulleinspeisung, aber nicht vor der
+        manuellen Einspeisung.
+      selector:
+        entity:
+          filter:
+            domain: input_boolean
+
+    dump_active_helper:
+      name: "Helfer: Speicher wird leergefahren"
+      description: >
+        Input Boolean, in dem der Modus "Maximale Einspeisung" speichert, ob er
+        den Speicher gerade gezielt leerfährt. Wird benötigt, weil ein Blueprint
+        selbst kein Gedächtnis über einzelne Durchläufe hinweg hat.
+        Die Automatisierung schaltet diesen Helfer selbstständig ein und aus –
+        er muss nur einmal als Helfer angelegt werden.
+        Wird nur im Modus "Maximale Einspeisung" verwendet.
+      selector:
+        entity:
+          filter:
+            domain: input_boolean
+
+    dump_start_soc:
+      name: "Leerfahren ab SOC (%)"
+      description: >
+        Nur für den Modus "Maximale Einspeisung": Erreicht der Ladezustand diesen
+        Wert, wird der Speicher mit voller Entladeleistung leergefahren – bis
+        hinunter zu "Leerfahren bis SOC". So ist nach einer Verschattungsphase
+        wieder Platz für den nächsten PV-Überschuss, statt dass der Wechselrichter
+        drosseln muss.
+        Auf 0 setzen, um das Leerfahren zu deaktivieren (dann wird nur die
+        PV-Leistung durchgereicht).
+      default: 80
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: slider
+
+    dump_stop_soc:
+      name: "Leerfahren bis SOC (%)"
+      description: >
+        Nur für den Modus "Maximale Einspeisung": Bis zu diesem Ladezustand wird
+        der Speicher leergefahren, danach wird wieder nur die PV-Leistung
+        durchgereicht. Höhere Werte = weniger Zyklen, aber auch weniger Puffer.
+        Werte unterhalb des minimalen SOC werden automatisch auf diesen angehoben.
+      default: 20
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: slider
 
     min_grid_import:
       name: "Minimaler Netzbezug (W)"
@@ -321,8 +392,12 @@ variables:
   zero_feed_in_entity: !input zero_feed_in_enabled
   manual_feed_in_entity: !input manual_feed_in_enabled
   manual_power_entity: !input manual_discharge_power
+  max_yield_entity: !input max_yield_enabled
+  dump_helper_entity: !input dump_active_helper
   force_mode_entity: !input force_mode_select
   # Numeric configuration values
+  dump_start_soc_value: !input dump_start_soc
+  dump_stop_soc_value: !input dump_stop_soc
   min_grid_import_value: !input min_grid_import
   dead_band_value: !input dead_band
   max_discharge_value: !input max_discharge_power
@@ -340,8 +415,11 @@ trigger:
   # React immediately when the grid power reading changes
   - trigger: state
     entity_id: !input grid_power_sensor
+  # React immediately when the PV reading changes. The max-yield mode follows PV
+  # directly and ignores the grid sensor, so it needs its own trigger.
+  - trigger: state
+    entity_id: !input pv_power_sensor
   # Periodic fallback: run every 10 seconds even if no state change occurs
-  # (also picks up PV changes without a dedicated high-frequency PV trigger)
   - trigger: time_pattern
     seconds: "/10"
   # When the user turns OFF zero-feed-in, we need to stop the battery
@@ -354,6 +432,11 @@ trigger:
     entity_id: !input manual_feed_in_enabled
     to: "off"
     id: "manual_feed_in_off"
+  # When the user turns OFF max-yield mode, we need to stop the battery
+  - trigger: state
+    entity_id: !input max_yield_enabled
+    to: "off"
+    id: "max_yield_off"
 
 ###############################################################################
 # Conditions – the automation only runs if at least one mode is active
@@ -370,21 +453,31 @@ condition:
       - condition: state
         entity_id: !input manual_feed_in_enabled
         state: "on"
+      # Run if max-yield mode is enabled
+      - condition: state
+        entity_id: !input max_yield_enabled
+        state: "on"
       # Run if the trigger was one of the mode toggles being turned off
       # (so we can execute the "default" stop action)
       - condition: trigger
         id:
           - zero_feed_in_off
           - manual_feed_in_off
-  # Grid power and SOC sensors must be available.
+          - max_yield_off
+  # The SOC sensor must always be available – every mode depends on it.
+  # The grid sensor is only required by the zero-feed-in controller; the manual
+  # and max-yield modes never read it, so an unavailable grid sensor must not
+  # block them.
   # PV sensor is NOT required here – it may be unavailable at night when the
   # solar inverter is off. The templates treat unavailable PV as 0 W.
   # This is a critical fix: previously, an unavailable PV sensor blocked the
   # entire automation, preventing battery discharge at night.
   - condition: template
     value_template: >
-      {{ states(grid_power_entity) not in ['unknown', 'unavailable'] and
-         states(soc_entity) not in ['unknown', 'unavailable'] }}
+      {{ states(soc_entity) not in ['unknown', 'unavailable'] and
+         (states(grid_power_entity) not in ['unknown', 'unavailable'] or
+          is_state(manual_feed_in_entity, 'on') or
+          is_state(max_yield_entity, 'on')) }}
 
 ###############################################################################
 # Actions – choose between manual feed-in, zero feed-in, or stop (default)
@@ -456,7 +549,149 @@ action:
               option: "{{ force_mode_option }}"
 
       #####################################################################
-      # Branch 2: AUTOMATIC ZERO FEED-IN (Nulleinspeisung)
+      # Branch 2: MAXIMUM FEED-IN / MAX YIELD (Maximale Einspeisung)
+      #
+      # For setups where every kWh leaving the AC port is worth the same
+      # (feed-in tariff, small battery, hard AC output limit). The goal is not
+      # to regulate the grid, but to maximise the energy pushed through the
+      # inverter and to keep headroom in the battery for the next PV peak.
+      #
+      #   day, battery not full  -> output = PV power (capped at max discharge)
+      #                             lossless pass-through, MPPT stores only the
+      #                             surplus above the cap
+      #   battery above          -> output = max discharge, LATCHED until
+      #   dump_start_soc            dump_stop_soc, so headroom is restored
+      #   night (PV = 0)         -> output = max discharge, down to min_soc
+      #
+      # The latch state lives in an input_boolean helper: a blueprint has no
+      # memory across runs, and it cannot be derived from the commanded
+      # discharge power (at PV > cap that value equals max discharge as well,
+      # without any dumping going on).
+      #####################################################################
+      - conditions:
+          - condition: state
+            entity_id: !input max_yield_enabled
+            state: "on"
+        sequence:
+          - variables:
+              # Current PV power; treat unavailable as 0 W. Consistent with the
+              # zero-feed-in branch: an offline inverter at night means 0 W, and
+              # 0 W is exactly the "night" case handled below.
+              pv_power: >
+                {% set pv_raw = states(pv_power_entity) %}
+                {{ pv_raw | float(0) if pv_raw not in ['unknown', 'unavailable'] else 0 }}
+              # Battery state of charge (%)
+              soc: "{{ states(soc_entity) | float(0) }}"
+              # Currently commanded discharge power (W) – needed for the ramp
+              current_discharge: >
+                {% set raw = states(discharge_entity) %}
+                {{ raw | float(0) if raw not in ['unknown', 'unavailable'] else 0 }}
+
+          - variables:
+              # Lower end of the dump run. Never go below the hard discharge
+              # limit, so a misconfigured dump_stop_soc cannot bypass min_soc.
+              dump_floor: "{{ [dump_stop_soc_value | float(0), min_soc_value | float(0)] | max }}"
+              # Latch entry: battery has reached the dump threshold.
+              # dump_start_soc = 0 disables the latch entirely.
+              dump_start: >
+                {{ dump_start_soc_value | float(0) > 0 and
+                   soc | float(0) >= dump_start_soc_value | float(0) }}
+              # Latch exit: battery is drained far enough
+              dump_stop: "{{ soc | float(0) <= dump_floor | float(0) }}"
+
+          - variables:
+              # Latched dump state: start on threshold, keep running while the
+              # helper is on and we have not reached the floor yet.
+              dumping: >
+                {{ dump_start or
+                   (is_state(dump_helper_entity, 'on') and not dump_stop) }}
+              # Target discharge power (W). Order of the rules is binding:
+              # the min_soc protection outranks every dump rule.
+              discharge_target: >
+                {%- if soc | float(0) <= min_soc_value | float(0) -%}
+                  {{ 0 }}
+                {%- elif dumping or pv_power | float(0) <= 0 or
+                         soc | float(0) >= max_soc_value | float(0) -%}
+                  {{ max_discharge_value | float(0) }}
+                {%- else -%}
+                  {{ [pv_power | float(0), max_discharge_value | float(0)] | min }}
+                {%- endif -%}
+
+          - variables:
+              # Apply ramp-up: limit the increase per cycle by discharge_step.
+              # Ramp-down is immediate (same behaviour as zero feed-in).
+              ramped_discharge: >
+                {%- set target = discharge_target | float(0) -%}
+                {%- set current = current_discharge | float(0) -%}
+                {%- set step = discharge_step_value | float(0) -%}
+                {%- if target > current -%}
+                  {{ [target, current + step] | min }}
+                {%- else -%}
+                  {{ target }}
+                {%- endif -%}
+              # This mode never charges from the grid – PV surplus is stored by
+              # the MPPT on the DC side, independently of the force mode.
+              force_mode_option: >
+                {%- if ramped_discharge | float(0) > 0 -%}
+                  discharge
+                {%- else -%}
+                  stop
+                {%- endif -%}
+              # Debug summary for HA trace analysis – all key values in one place
+              debug_message: >
+                MAX-YIELD: PV={{ pv_power }}W, SOC={{ soc }}%,
+                current_D={{ current_discharge }}W,
+                dump_start={{ dump_start }}, dump_stop={{ dump_stop }},
+                dump_floor={{ dump_floor }}%, dumping={{ dumping }},
+                D_target={{ discharge_target }}W, ramped_D={{ ramped_discharge }}W,
+                mode={{ force_mode_option }}
+
+          # Log the debug summary for easy troubleshooting
+          - action: system_log.write
+            data:
+              message: "Nulleinspeisung {{ debug_message }}"
+              level: debug
+              logger: "blueprint.marstek_nulleinspeisung"
+
+          # Persist the latch state, but only when it actually changes –
+          # this automation runs every 10 s and we do not want to churn the
+          # helper's state history.
+          - if:
+              - condition: template
+                value_template: "{{ dumping and not is_state(dump_helper_entity, 'on') }}"
+            then:
+              - action: input_boolean.turn_on
+                target:
+                  entity_id: "{{ dump_helper_entity }}"
+          - if:
+              - condition: template
+                value_template: "{{ not dumping and not is_state(dump_helper_entity, 'off') }}"
+            then:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: "{{ dump_helper_entity }}"
+
+          # Zero out charge power first, then set the discharge power
+          - action: number.set_value
+            target:
+              entity_id: "{{ charge_entity }}"
+            data:
+              value: 0
+          - action: number.set_value
+            target:
+              entity_id: "{{ discharge_entity }}"
+            data:
+              value: "{{ ramped_discharge | round(0) | int }}"
+
+          # Set the force mode last – the power values are already set correctly
+          - action: select.select_option
+            target:
+              entity_id: "{{ force_mode_entity }}"
+            data:
+              option: "{{ force_mode_option }}"
+
+      #####################################################################
+      # Branch 3: AUTOMATIC ZERO FEED-IN (Nulleinspeisung)
       # Calculates the optimal battery power to keep grid import at the
       # configured target (min_grid_import) with minimal export.
       #####################################################################
